@@ -6,7 +6,8 @@ public final class LogoutSites {
     public static String[] forPage(int page) {
         if (page == 0) return new String[]{"taobao.com", "tmall.com", "alipay.com", "cainiao.com", "alibaba.com"};
         if (page == 1) return new String[]{"pinduoduo.net"};
-        if (page == 2) return new String[]{"jd.com", "sf-express.com", "jinritemai.com", "snssdk.com", "douyin.com"};
+        if (page == 2) return new String[]{"jd.com", "jdl.com"};
+        if (page == 3) return new String[]{"jd.com", "sf-express.com", "jinritemai.com", "snssdk.com", "douyin.com", "jdl.com"};
         throw new IllegalArgumentException("Unknown page");
     }
     public static String[] forPickupProvider(int provider) {
@@ -15,6 +16,8 @@ public final class LogoutSites {
         if (provider == 2) return new String[]{"jd.com"};
         if (provider == 3) return new String[]{"sf-express.com"};
         if (provider == 4) return new String[]{"jinritemai.com", "snssdk.com", "douyin.com"};
-        return forPage(2);
+        if (provider == 5) return new String[]{"cainiao.com"};
+        if (provider == 6) return new String[]{"jdl.com"};
+        return forPage(3);
     }
 }

@@ -47,6 +47,60 @@ final class LiquidGlassBar extends SwipeFrameLayout {
     private float glassEnergy;
     private ValueAnimator energyAnimator;
     private boolean dark;
+    private int identitySubMode = 0;
+    private int hoveredSubMode = 0;
+    private boolean tab1Expanded = false;
+    private float tab1Scale = 1.0f;
+    private ValueAnimator tab1ScaleAnimator;
+    private java.util.function.IntConsumer onSubModeChanged;
+
+    public void setIdentitySubMode(int mode) {
+        if (this.identitySubMode != mode) {
+            this.identitySubMode = mode;
+            this.hoveredSubMode = mode;
+            invalidate();
+        }
+    }
+
+    public void setOnSubModeChanged(java.util.function.IntConsumer listener) {
+        this.onSubModeChanged = listener;
+    }
+
+    public void setTab1Expanded(boolean expanded) {
+        if (tab1Expanded == expanded) return;
+        tab1Expanded = expanded;
+        if (expanded) {
+            hoveredSubMode = identitySubMode;
+        }
+        if (tab1ScaleAnimator != null) tab1ScaleAnimator.cancel();
+        tab1ScaleAnimator = ValueAnimator.ofFloat(tab1Scale, expanded ? 1.25f : 1.0f);
+        tab1ScaleAnimator.setDuration(expanded ? 180 : 220);
+        tab1ScaleAnimator.setInterpolator(new OvershootInterpolator(expanded ? 1.4f : 1.0f));
+        tab1ScaleAnimator.addUpdateListener(anim -> {
+            tab1Scale = (Float) anim.getAnimatedValue();
+            invalidate();
+        });
+        tab1ScaleAnimator.start();
+        invalidate();
+    }
+
+    public void setHoveredSubMode(int mode) {
+        if (hoveredSubMode != mode) {
+            hoveredSubMode = mode;
+            try {
+                performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK);
+            } catch (Exception ignored) {}
+            invalidate();
+        }
+    }
+
+    public void commitSubModeSelection() {
+        setTab1Expanded(false);
+        setIdentitySubMode(hoveredSubMode);
+        if (onSubModeChanged != null) {
+            onSubModeChanged.accept(hoveredSubMode);
+        }
+    }
 
     LiquidGlassBar(Context context) {
         super(context);
@@ -311,8 +365,8 @@ final class LiquidGlassBar extends SwipeFrameLayout {
         float stretchX = 1f + 0.18f * inFlight + 0.06f * glassEnergy + 0.08f * speedFactor;
         float swellY = 1f + 0.11f * effect;
         float pillW = baseWidth * stretchX;
-        float baseH = shellBounds.height() - dp(7);
-        float pillH = baseH * swellY;
+        float baseH = shellBounds.height() - dp(10);
+        float pillH = Math.min(shellBounds.height() - dp(6), baseH * swellY);
 
         float skewShift = Math.max(-dp(5), Math.min(dp(5), smoothedVelocity * dp(0.9f)));
         dropletBounds.set(
@@ -329,6 +383,19 @@ final class LiquidGlassBar extends SwipeFrameLayout {
             dropletBounds.offset(minL - dropletBounds.left, 0);
         } else if (dropletBounds.right > maxR) {
             dropletBounds.offset(maxR - dropletBounds.right, 0);
+        }
+        float minT = shellBounds.top + dp(3.5f);
+        float maxB = shellBounds.bottom - dp(3.5f);
+        if (dropletBounds.top < minT) {
+            dropletBounds.top = minT;
+        }
+        if (dropletBounds.bottom > maxB) {
+            dropletBounds.bottom = maxB;
+        }
+        if (tab1Scale > 1.001f && Math.abs(clampedPos - 1f) < 0.6f) {
+            float scaleExtra = (tab1Scale - 1.0f);
+            float growW = dp(16) * (scaleExtra / 0.25f);
+            dropletBounds.inset(-growW, 0);
         }
         float dropletRadius = dropletBounds.height() / 2f;
         dropletPath.reset();
@@ -402,7 +469,8 @@ final class LiquidGlassBar extends SwipeFrameLayout {
             0x00ffffff,
             Shader.TileMode.CLAMP
         ));
-        canvas.drawRoundRect(meniscusBounds, dropletRadius, dropletRadius, paint);
+        float topMeniscusRadius = Math.min(dropletRadius, meniscusBounds.height() / 2f);
+        canvas.drawRoundRect(meniscusBounds, topMeniscusRadius, topMeniscusRadius, paint);
 
         // Bottom warm caustic refraction glow
         meniscusBounds.set(
@@ -417,7 +485,8 @@ final class LiquidGlassBar extends SwipeFrameLayout {
             dark ? 0x38ff784e : 0x2eff784e,
             Shader.TileMode.CLAMP
         ));
-        canvas.drawRoundRect(meniscusBounds, dropletRadius, dropletRadius, paint);
+        float bottomMeniscusRadius = Math.min(dropletRadius, meniscusBounds.height() / 2f);
+        canvas.drawRoundRect(meniscusBounds, bottomMeniscusRadius, bottomMeniscusRadius, paint);
         canvas.restore();
 
         // 5. Refractive prism rim border around the active glass droplet
@@ -436,18 +505,61 @@ final class LiquidGlassBar extends SwipeFrameLayout {
         canvas.drawRoundRect(dropletBounds, dropletRadius, dropletRadius, strokePaint);
 
         // Keep titles on one stable layer above the moving glass.
-        textPaint.setTextSize(dp(13.5f));
         textPaint.setTypeface(Typeface.create("sans-serif", Typeface.BOLD));
-        Paint.FontMetrics fm = textPaint.getFontMetrics();
-        float baseline = shellBounds.centerY() - (fm.ascent + fm.descent) * 0.5f;
+        float labelSize = dp(13.5f);
         for (int i = 0; i < count; i++) {
             Button btn = tabs[i];
             if (btn == null) continue;
             float weight = Math.max(0f, 1f - Math.abs(clampedPos - i));
-            textPaint.setColor(blendArgb(AppTheme.muted(dark), AppTheme.accentText(dark), weight));
-            textPaint.setAlpha(255);
-            canvas.drawText(btn.getText().toString(), rowLeft + btn.getLeft() + btn.getWidth() * 0.5f,
-                baseline, textPaint);
+            String txt = btn.getText().toString();
+            float tabCenterX = rowLeft + btn.getLeft() + btn.getWidth() * 0.5f;
+            int pipeIdx = txt.indexOf('|');
+            textPaint.setTextSize(labelSize);
+            float width = textPaint.measureText(txt) * (pipeIdx >= 0 ? Math.max(1f, tab1Scale) : 1f);
+            float available = Math.max(1f, btn.getWidth() - dp(6));
+            if (width > available) textPaint.setTextSize(labelSize * available / width);
+            float baseline = shellBounds.centerY() - (textPaint.ascent() + textPaint.descent()) * 0.5f;
+            if (pipeIdx >= 0) {
+                String leftPart = txt.substring(0, pipeIdx).trim();
+                String rightPart = txt.substring(pipeIdx + 1).trim();
+                String sep = " | ";
+                float wLeft = textPaint.measureText(leftPart);
+                float wSep = textPaint.measureText(sep);
+                float wRight = textPaint.measureText(rightPart);
+                float totalW = wLeft + wSep + wRight;
+                float startX = tabCenterX - totalW * 0.5f;
+                int activeCol = AppTheme.accentText(dark);
+                int mutedCol = AppTheme.muted(dark);
+                int effectiveSub = tab1Expanded ? hoveredSubMode : identitySubMode;
+                int leftCol, rightCol;
+                if (weight > 0.4f || tab1Expanded) {
+                    leftCol = (effectiveSub == 0) ? activeCol : blendArgb(mutedCol, activeCol, 0.28f);
+                    rightCol = (effectiveSub == 1) ? activeCol : blendArgb(mutedCol, activeCol, 0.28f);
+                } else {
+                    leftCol = mutedCol;
+                    rightCol = mutedCol;
+                }
+                if (tab1Scale > 1.001f) {
+                    canvas.save();
+                    canvas.scale(tab1Scale, tab1Scale, tabCenterX, baseline);
+                }
+                textPaint.setTextAlign(Paint.Align.LEFT);
+                textPaint.setColor(leftCol);
+                canvas.drawText(leftPart, startX, baseline, textPaint);
+                textPaint.setColor(mutedCol);
+                canvas.drawText(sep, startX + wLeft, baseline, textPaint);
+                textPaint.setColor(rightCol);
+                canvas.drawText(rightPart, startX + wLeft + wSep, baseline, textPaint);
+                textPaint.setTextAlign(Paint.Align.CENTER);
+                if (tab1Scale > 1.001f) {
+                    canvas.restore();
+                }
+            } else {
+                textPaint.setTextAlign(Paint.Align.CENTER);
+                textPaint.setColor(blendArgb(AppTheme.muted(dark), AppTheme.accentText(dark), weight));
+                textPaint.setAlpha(255);
+                canvas.drawText(txt, tabCenterX, baseline, textPaint);
+            }
         }
 
         if (effect > 0.02f && Math.abs(smoothedVelocity) > 0.05f) {

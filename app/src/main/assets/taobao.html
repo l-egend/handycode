@@ -43,16 +43,19 @@ html:not([data-hc-theme="light"]) .hc-section-placeholder i::after{background:li
 @media(prefers-reduced-motion:reduce){.hc-section-placeholder i::after,.hc-content > .hc-section-enter{animation:none}}
 /* Only extracted DOM is visible. Source documents never receive touches. */
 .hc-card:nth-of-type(2){display:none!important}
+.hc-actions [data-phone-manage]:not([hidden]) + button{position:relative}
+.hc-actions [data-phone-manage]:not([hidden]) + button::before{content:'';position:absolute;left:-6px;top:50%;height:10px;border-left:1px solid #e1e5eb;transform:translateY(-50%)}
+html[data-hc-theme="dark"] .hc-actions [data-phone-manage]:not([hidden]) + button::before{border-left-color:#333c4d}
 .hc-source{position:fixed;left:-100000px;top:0;width:calc(100vw - 42px);height:1000px;border:0;pointer-events:none}
 </style>
 </head>
 <body id="handycode-merged">
 <section class="hc-card">
-<div class="hc-heading"><h2>身份码</h2><div class="hc-actions"><button data-refresh="identity" type="button">刷新</button></div></div>
+<div class="hc-heading"><h2>身份码</h2><div class="hc-actions"><button data-phone-manage type="button" hidden>号码管理 / 添加包裹</button><button data-refresh="identity" type="button">刷新</button></div></div>
 <div class="hc-content" id="identity-content"><div class="hc-loading">正在加载官方身份码…</div></div>
 </section>
 <section class="hc-card">
-<div class="hc-heading"><h2>待取包裹</h2><div class="hc-actions"><button data-refresh="parcels" type="button">刷新</button></div></div>
+<div class="hc-heading"><h2>待取包裹</h2><div class="hc-actions"><button data-phone-manage type="button" hidden>查手机号 / 添加包裹</button><button data-refresh="parcels" type="button">刷新</button></div></div>
 <div class="hc-content" id="parcels-content"><div class="hc-loading">正在加载官方包裹列表…</div></div>
 </section>
 <iframe class="hc-source" id="identity-source" src="@@IDENTITY_URL@@" title="身份码数据来源" aria-hidden="true" tabindex="-1" sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox"></iframe>
@@ -63,6 +66,10 @@ html:not([data-hc-theme="light"]) .hc-section-placeholder i::after{background:li
 (function(){
 'use strict';
 var sources={},links=new WeakMap(),savedStyles=new WeakMap(),touching=false,lastTouch=0,darkOverride=null;
+var phoneManageButtons=document.querySelectorAll('[data-phone-manage]'),officialPhoneManage;
+phoneManageButtons.forEach(function(btn){
+ btn.addEventListener('click',function(){if(officialPhoneManage&&officialPhoneManage.isConnected)officialPhoneManage.click()});
+});
 function isDark(){
  if(darkOverride!==null)return darkOverride;
  if(document.documentElement&&document.documentElement.getAttribute('data-hc-theme')==='dark')return true;
@@ -228,6 +235,18 @@ function project(state){
   // A refresh can leave the previous document accessible until navigation starts.
   if(doc===state.staleDocument)return;
   bindDocument(state,doc);
+  if(state.type==='identity'||state.type==='parcels'){
+   var manage=textElement(doc,'添加手机号')||textElement(doc,'添加包裹')||textElement(doc,'查手机号')||textElement(doc,'绑定手机号')||textElement(doc,'号码管理')||textElement(doc,'管理');
+   if(!manage){
+    var linksList=doc.querySelectorAll('a[href*="phone-manage"],a[href*="add-friend"],a[href*="mobile"],a[href*="search"],a[href*="package"]');
+    if(linksList.length)manage=linksList[0];
+   }
+   if(manage){
+    var a=manage.closest('a[href]')||(manage.tagName==='A'?manage:manage);
+    if(a)officialPhoneManage=a;
+    phoneManageButtons.forEach(function(btn){btn.hidden=false});
+   }
+  }
   if(state.type==='identity'){
    var barcode=doc.querySelector('img[class*="width-origin--"],img[class*="width-rotate--"]');
    if(!barcode||!barcode.complete||barcode.naturalWidth===0){HandyCodeOfficialIdentity.recover(doc,Date.now());return;}
@@ -267,7 +286,7 @@ function project(state){
   if(signature===state.signature&&state.mount.dataset.ready){state.controller.finish();return}
   var tabs=state.type==='parcels'?statusTabs(doc):null;
   var skip=state.type==='parcels'?function(node){
-   return node===tabs||node.nodeType===1&&(node.textContent||'').replace(/\s/g,'')==='添加包裹';
+   return node===tabs;
   }:null;
   var fresh=clone(root,doc,{count:6000},skip);
   if(!fresh)return;

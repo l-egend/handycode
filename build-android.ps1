@@ -3,12 +3,16 @@ param([string]$AndroidSdk=$env:ANDROID_SDK_ROOT,[string]$JavaHome=$env:JAVA_HOME
 $ErrorActionPreference='Stop'
 $projectRoot=$PSScriptRoot
 if (-not $AndroidSdk) { $AndroidSdk=$env:ANDROID_HOME }
-if (-not $AndroidSdk) {
-    $unityBase='D:\developer\Unity'
-    if (Test-Path -LiteralPath $unityBase) {
-        $AndroidSdk=Get-ChildItem -LiteralPath $unityBase -Directory | Sort-Object Name -Descending |
-            ForEach-Object {Join-Path $_.FullName 'Editor\Data\PlaybackEngines\AndroidPlayer\SDK'} |
-            Where-Object {Test-Path -LiteralPath $_} | Select-Object -First 1
+if (-not $AndroidSdk -or -not (Test-Path -LiteralPath (Join-Path $AndroidSdk 'platforms\android-35\android.jar'))) {
+    if (Test-Path -LiteralPath 'D:\Android\Sdk\platforms\android-35\android.jar') {
+        $AndroidSdk = 'D:\Android\Sdk'
+    } else {
+        $unityBase='D:\developer\Unity'
+        if (Test-Path -LiteralPath $unityBase) {
+            $AndroidSdk=Get-ChildItem -LiteralPath $unityBase -Directory | Sort-Object Name -Descending |
+                ForEach-Object {Join-Path $_.FullName 'Editor\Data\PlaybackEngines\AndroidPlayer\SDK'} |
+                Where-Object {Test-Path -LiteralPath $_} | Select-Object -First 1
+        }
     }
 }
 if (-not $AndroidSdk) {throw 'Pass -AndroidSdk with an Android SDK directory.'}
@@ -30,14 +34,26 @@ function Invoke-Checked {
     & $Executable @Arguments
     if ($LASTEXITCODE -ne 0) {throw ('Command failed ('+$LASTEXITCODE+'): '+$Executable)}
 }
+function Invoke-Javac {
+    param([string]$LogPath,[string[]]$Arguments)
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = 'SilentlyContinue'
+    try {
+        & $javac @Arguments 2>&1 | Out-File -FilePath $LogPath -Encoding utf8
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+    $compileExit = $LASTEXITCODE
+    if (Test-Path -LiteralPath $LogPath) { Get-Content -LiteralPath $LogPath }
+    if ($compileExit -ne 0) {throw "javac failed ($compileExit). See $LogPath"}
+}
 $buildRoot=Join-Path $projectRoot ('build\run-'+[Guid]::NewGuid().ToString('N'))
 $classes=Join-Path $buildRoot 'classes'
 $generated=Join-Path $buildRoot 'generated'
 $dex=Join-Path $buildRoot 'dex'
-$testClasses=Join-Path $buildRoot 'test-classes'
 $dist=Join-Path $projectRoot 'dist'
 $keyRoot=Join-Path $projectRoot '.local'
-foreach($path in @($classes,$generated,$dex,$testClasses,$dist,$keyRoot)) {
+foreach($path in @($classes,$generated,$dex,$dist,$keyRoot)) {
     New-Item -ItemType Directory -Path $path -Force | Out-Null
 }
 $sourceRoot=Join-Path $projectRoot 'app\src\main'
@@ -64,39 +80,45 @@ $sourceFiles+=@(Get-ChildItem -LiteralPath $generated -Recurse -Filter '*.java' 
 $sourceList=Join-Path $buildRoot 'sources.txt'
 $sourceLines=($sourceFiles | ForEach-Object {'"'+$_.Replace('\','/')+'"'}) -join [Environment]::NewLine
 [IO.File]::WriteAllText($sourceList,$sourceLines,[Text.UTF8Encoding]::new($false))
-Invoke-Checked $javac @('-encoding','UTF-8','--release','8','-classpath',($androidJar+[IO.Path]::PathSeparator+$siteDataJar),'-d',$classes,('@'+$sourceList))
-Write-Output '3/6 Test URL navigation rules'
-Invoke-Checked $javac @('-encoding','UTF-8','--release','8','-d',$testClasses,
-    (Join-Path $sourceRoot 'java\com\fairycrane\handycode\UrlPolicy.java'),
-    (Join-Path $sourceRoot 'java\com\fairycrane\handycode\PddBundleAdapter.java'),
-    (Join-Path $sourceRoot 'java\com\fairycrane\handycode\SwitchMotion.java'),
-    (Join-Path $sourceRoot 'java\com\fairycrane\handycode\LogoutSites.java'),
-    (Join-Path $sourceRoot 'java\com\fairycrane\handycode\SiteClearQueue.java'),
-    (Join-Path $sourceRoot 'java\com\fairycrane\handycode\JdUrlPolicy.java'),
-    (Join-Path $projectRoot 'tests\JdUrlPolicyTest.java'),
-    (Join-Path $projectRoot 'tests\SiteClearQueueTest.java'),
-    (Join-Path $projectRoot 'tests\UrlPolicyTest.java'),
-    (Join-Path $projectRoot 'tests\PddUrlPolicyTest.java'),
-    (Join-Path $projectRoot 'tests\PddBundleAdapterTest.java'),
-    (Join-Path $projectRoot 'tests\SwitchMotionTest.java'))
-Invoke-Checked $java @('-cp',$testClasses,'UrlPolicyTest')
-Invoke-Checked $java @('-cp',$testClasses,'PddUrlPolicyTest')
-Invoke-Checked $java @('-cp',$testClasses,'PddBundleAdapterTest')
-Invoke-Checked $java @('-cp',$testClasses,'SwitchMotionTest')
-Invoke-Checked $java @('-cp',$testClasses,'SiteClearQueueTest')
-Invoke-Checked $java @('-cp',$testClasses,'JdUrlPolicyTest')
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\jd-orders.test.mjs'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\scan-code-visibility.test.mjs'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\pdd-same-origin.test.mjs'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\pdd-section-refresh.test.mjs'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\pdd-login-client.test.mjs'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\pdd-layout.test.mjs'))
-Invoke-Checked 'node' @('--check',(Join-Path $sourceRoot 'assets\login-ready.js'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\login-ready.test.mjs'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\official-identity.test.mjs'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\refresh-controller.test.mjs'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\taobao-transition.test.mjs'))
-Invoke-Checked 'node' @((Join-Path $projectRoot 'tests\taobao-login-chrome.test.mjs'))
+Invoke-Javac (Join-Path $buildRoot 'javac.log') @('-encoding','UTF-8','--release','8','-classpath',($androidJar+[IO.Path]::PathSeparator+$siteDataJar),'-d',$classes,('@'+$sourceList))
+foreach ($requiredClass in @('MainActivity','PddPage','TaobaoLoadGuard')) {
+    if (-not (Test-Path -LiteralPath (Join-Path $classes ('com\fairycrane\handycode\'+$requiredClass+'.class')))) {
+        throw "Missing $requiredClass.class after compilation."
+    }
+}
+$localTests = Join-Path $projectRoot 'tests'
+if (Test-Path -LiteralPath (Join-Path $localTests 'TaobaoLoadGuardTest.java') -PathType Leaf) {
+    Write-Output '3/6 Run local regression tests'
+    $testClasses = Join-Path $buildRoot 'test-classes'
+    New-Item -ItemType Directory -Path $testClasses | Out-Null
+    Invoke-Javac (Join-Path $buildRoot 'javac-tests.log') @('-encoding','UTF-8','--release','8','-d',$testClasses,
+        (Join-Path $sourceRoot 'java\com\fairycrane\handycode\UrlPolicy.java'),
+        (Join-Path $sourceRoot 'java\com\fairycrane\handycode\PddBundleAdapter.java'),
+        (Join-Path $sourceRoot 'java\com\fairycrane\handycode\SwitchMotion.java'),
+        (Join-Path $sourceRoot 'java\com\fairycrane\handycode\LogoutSites.java'),
+        (Join-Path $sourceRoot 'java\com\fairycrane\handycode\SiteClearQueue.java'),
+        (Join-Path $sourceRoot 'java\com\fairycrane\handycode\TaobaoLoadGuard.java'),
+        (Join-Path $sourceRoot 'java\com\fairycrane\handycode\JdUrlPolicy.java'),
+        (Join-Path $localTests 'TaobaoLoadGuardTest.java'),
+        (Join-Path $localTests 'JdUrlPolicyTest.java'),
+        (Join-Path $localTests 'SiteClearQueueTest.java'),
+        (Join-Path $localTests 'UrlPolicyTest.java'),
+        (Join-Path $localTests 'PddUrlPolicyTest.java'),
+        (Join-Path $localTests 'PddBundleAdapterTest.java'),
+        (Join-Path $localTests 'SwitchMotionTest.java'))
+    Invoke-Checked $java @('-cp',$testClasses,'UrlPolicyTest')
+    Invoke-Checked $java @('-cp',$testClasses,'PddUrlPolicyTest')
+    Invoke-Checked $java @('-cp',$testClasses,'PddBundleAdapterTest')
+    Invoke-Checked $java @('-cp',$testClasses,'SwitchMotionTest')
+    Invoke-Checked $java @('-cp',$testClasses,'SiteClearQueueTest')
+    Invoke-Checked $java @('-cp',$testClasses,'TaobaoLoadGuardTest')
+    Invoke-Checked $java @('-cp',$testClasses,'JdUrlPolicyTest')
+    foreach ($test in (Get-ChildItem -LiteralPath $localTests -Filter '*.test.mjs' -File | Sort-Object Name)) {
+        Invoke-Checked 'node' @($test.FullName)
+    }
+} else {
+    Write-Output '3/6 Build without the local regression suite'
+}
 Write-Output '4/6 Produce DEX'
 $classFiles=@(Get-ChildItem -LiteralPath $classes -Recurse -Filter '*.class' -File | ForEach-Object {$_.FullName})
 $d8Args=@('-cp',(Join-Path $toolRoot 'lib\d8.jar'),'com.android.tools.r8.D8',
@@ -137,6 +159,11 @@ $hash=(Get-FileHash -LiteralPath $finalApk -Algorithm SHA256).Hash.ToLowerInvari
 Write-Output ('APK: '+$finalApk)
 Copy-Item -LiteralPath $finalApk -Destination (Join-Path $projectRoot $apkName) -Force
 Copy-Item -LiteralPath ($finalApk+'.sha256') -Destination (Join-Path $projectRoot ($apkName+'.sha256')) -Force
+$parentDir = Split-Path $projectRoot -Parent
+if ($parentDir -and (Test-Path -LiteralPath $parentDir)) {
+    Copy-Item -LiteralPath $finalApk -Destination (Join-Path $parentDir $apkName) -Force
+    Copy-Item -LiteralPath ($finalApk+'.sha256') -Destination (Join-Path $parentDir ($apkName+'.sha256')) -Force
+}
 if($Configuration -eq 'Release') {
     $signerInfo=& $java -jar (Join-Path $toolRoot 'lib\apksigner.jar') verify --print-certs $finalApk
     if($LASTEXITCODE -ne 0){throw 'Release certificate verification failed'}

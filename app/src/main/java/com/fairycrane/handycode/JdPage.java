@@ -1,4 +1,5 @@
 package com.fairycrane.handycode;
+import android.app.AlertDialog;
 import android.content.Context;
 import android.content.SharedPreferences;
 import android.graphics.Color;
@@ -9,6 +10,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.webkit.*;
 import android.widget.*;
+import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 import androidx.webkit.internal.WebViewGlueCommunicator;
 import org.chromium.support_lib_boundary.WebSettingsBoundaryInterface;
@@ -27,44 +29,58 @@ import java.util.function.IntConsumer;
 /** Multi-platform pickup code aggregator + official login switcher (TB, PDD, JD, SF, Douyin). */
 final class JdPage extends LinearLayout {
  static final int MODE_SUMMARY = -1;
- static final int PROVIDER_TB = 0, PROVIDER_PDD = 1, PROVIDER_JD = 2, PROVIDER_SF = 3, PROVIDER_DY = 4, PROVIDER_COUNT = 5;
- static final String[] PROVIDER_NAMES = {"淘宝", "拼多多", "京东", "顺丰", "抖音"};
- private static final int[] BADGE_COLORS = {0xFFFF5000, 0xFFE02E24, 0xFFE1251B, 0xFF2B313D, 0xFF1F2332};
+ static final int PROVIDER_TB = 0, PROVIDER_PDD = 1, PROVIDER_JD = 2, PROVIDER_SF = 3, PROVIDER_DY = 4, PROVIDER_JDL = 6, PROVIDER_COUNT = 7;
+ static final String[] PROVIDER_NAMES = {"淘宝/菜鸟", "拼多多", "京东", "顺丰", "抖音", "", "京东快递"};
+ // Preserve the existing cache indices when removing the duplicate Cainiao entry.
+ private static final int LEGACY_CN_SLOT = 5;
+ private static final int[] PLATFORMS = {PROVIDER_TB, PROVIDER_PDD, PROVIDER_JD, PROVIDER_SF, PROVIDER_DY};
+ private static final int[] BADGE_COLORS = {0xFFFF5000, 0xFFE02E24, 0xFFE1251B, 0xFF2B313D, 0xFF1F2332, 0xFF0066FF, 0xFFE1251B};
  private static final String PREF_CACHE = "hc_pickup_cache";
+ private static final String PREF_MANUAL_JDL_CODES = "manual_jdl_pickup_codes";
+ private static final String PREF_TAOBAO_ORDER_CODES = "taobao_order_pickup_codes";
+ private static final int MAX_TAOBAO_ORDERS = 80;
+ private static final String DY_ORDER_LOGIN_HINT = "抖音订单需要重新授权。点「刷新网页」回到官网验证。";
+ private static final Set<String> JD_ORDER_ORIGINS = new HashSet<>(Arrays.asList(
+  "https://trade.m.jd.com", "https://my.m.jd.com"));
 
  private final Consumer<Boolean> session;
  private final IntConsumer externalSwitch;
  private final Runnable onModeChanged;
  private final TextView status, pullBanner;
- private final LinearLayout tools, cards;
+ private final LinearLayout tools, toolButtons, cards;
+ private final View toolSpace;
  private final FrameLayout stage, webContainer;
  private final ScrollView results;
  private float pullDownX, pullDownY, pullStartY, pullOffset;
  private int pullDirection;
- private final Button backToSummaryBtn, refreshBtn, switchSoftwareBtn;
+ private final Button backToSummaryBtn, refreshBtn, switchSoftwareBtn, providerOptionsBtn, dySmsBtn;
  private final WebView[] webs = new WebView[PROVIDER_COUNT];
  private final String[] scripts = new String[PROVIDER_COUNT];
- private final String[] lastSnapshots = {"", "", "", "", ""};
+ private final String[] lastSnapshots = new String[PROVIDER_COUNT];
  private final boolean[] providerSignedIn = new boolean[PROVIDER_COUNT];
  private final boolean[] pendingAutoSummary = new boolean[PROVIDER_COUNT];
  private final boolean[] inFlight = new boolean[PROVIDER_COUNT];
  private final int[] generations = new int[PROVIDER_COUNT];
  private final long[] lastDySsoRedirect = new long[1];
- private final long[] lastJdLoginRedirect = new long[1];
- private final long[] lastJdFallback = new long[1];
+ private boolean jdLoginRedirected;
  private static final String DY_DESKTOP_UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
  private String dyMobileUa = "";
- private boolean jdPreferMyHome = false;
- private final String[] providerErrors = {"", "", "", "", ""};
+ private final String[] providerErrors = new String[PROVIDER_COUNT];
  private final JSONArray[] providerOrders = new JSONArray[PROVIDER_COUNT];
+ private final JSONArray manualJdlCodes = new JSONArray();
+ private final LinkedHashMap<String, JSONArray> taobaoOrderCodes = new LinkedHashMap<>();
  private final List<String[]> dyApiHistory = new CopyOnWriteArrayList<>();
 
  private int mode = MODE_SUMMARY;
  private boolean dark, paused = false, activeTab = false, destroyed, polling;
- private boolean dyLoginCompleted = false;
- private boolean sfPendingOpenLogin = false;
+ private boolean dyOrderNeedsAuthorization, resettingSfLogin, dySmsLoginOffered;
  private long dyLoginSuccessAt = 0L;
+ private volatile int dyNavigationEpoch;
  private String lastSummarySignature = "";
+ private final boolean[] pageCommitted = new boolean[PROVIDER_COUNT];
+ private FrameLayout loadingOverlay;
+ private TextView loadingStatusText;
+ private ProgressBar loadingSpinner;
  private final Runnable tick = new Runnable() {
   @Override public void run() {
    polling = false;
@@ -84,6 +100,8 @@ final class JdPage extends LinearLayout {
   this.externalSwitch = externalSwitch;
   this.onModeChanged = onModeChanged;
   setOrientation(VERTICAL);
+  Arrays.fill(lastSnapshots, "");
+  Arrays.fill(providerErrors, "");
   for (int i = 0; i < PROVIDER_COUNT; i++) providerOrders[i] = new JSONArray();
   loadCachedState();
 
@@ -92,22 +110,38 @@ final class JdPage extends LinearLayout {
   tools.setPadding(dp(12), dp(6), dp(12), dp(6));
 
   status = text("自动拉取并汇总已登录软件的取件码；点击左上角可切换软件登录。", 12);
-  LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(0, -2, 1f);
-  statusLp.setMarginEnd(dp(8));
-  tools.addView(status, statusLp);
+  status.setMaxLines(2);
+  status.setEllipsize(android.text.TextUtils.TruncateAt.END);
+  tools.addView(status);
+
+  toolButtons = new LinearLayout(context);
+  toolButtons.setGravity(Gravity.CENTER_VERTICAL);
+  tools.addView(toolButtons);
 
   backToSummaryBtn = action("‹ 返回汇总", this::showSummary);
   LinearLayout.LayoutParams backLp = new LinearLayout.LayoutParams(-2, dp(34));
   backLp.setMarginEnd(dp(6));
-  tools.addView(backToSummaryBtn, backLp);
+  toolButtons.addView(backToSummaryBtn, backLp);
 
   switchSoftwareBtn = action("切换软件", () -> externalSwitch.accept(-1));
   LinearLayout.LayoutParams swLp = new LinearLayout.LayoutParams(-2, dp(34));
   swLp.setMarginEnd(dp(6));
-  tools.addView(switchSoftwareBtn, swLp);
+  toolButtons.addView(switchSoftwareBtn, swLp);
+
+  toolSpace = new View(context);
+  toolButtons.addView(toolSpace, new LinearLayout.LayoutParams(0, 0, 1f));
+
+  dySmsBtn = action("验证码登录", this::openDySmsLogin);
+  LinearLayout.LayoutParams smsLp = new LinearLayout.LayoutParams(-2, dp(34));
+  smsLp.setMarginEnd(dp(6));
+  toolButtons.addView(dySmsBtn, smsLp);
 
   refreshBtn = action("刷新全部", this::reloadActiveOrAll);
-  tools.addView(refreshBtn, new LinearLayout.LayoutParams(-2, dp(34)));
+  toolButtons.addView(refreshBtn, new LinearLayout.LayoutParams(-2, dp(34)));
+  providerOptionsBtn = action("更多 ▾", this::showProviderOptions);
+  LinearLayout.LayoutParams optionsLp = new LinearLayout.LayoutParams(-2, dp(34));
+  optionsLp.setMarginStart(dp(6));
+  toolButtons.addView(providerOptionsBtn, optionsLp);
   addView(tools);
 
   stage = new FrameLayout(context);
@@ -115,6 +149,24 @@ final class JdPage extends LinearLayout {
 
   webContainer = new FrameLayout(context);
   stage.addView(webContainer, new FrameLayout.LayoutParams(-1, -1));
+
+  loadingOverlay = new FrameLayout(context);
+  loadingOverlay.setBackgroundColor(AppTheme.bg(dark));
+  loadingOverlay.setClickable(true);
+  LinearLayout loadingBox = new LinearLayout(context);
+  loadingBox.setOrientation(VERTICAL);
+  loadingBox.setGravity(Gravity.CENTER);
+  loadingSpinner = new ProgressBar(context);
+  loadingBox.addView(loadingSpinner, new LinearLayout.LayoutParams(dp(38), dp(38)));
+  loadingStatusText = text("\u6b63\u5728\u5b89\u5168\u52a0\u8f7d\u5b98\u65b9\u9875\u9762\u2026", 13);
+  loadingStatusText.setGravity(Gravity.CENTER);
+  loadingStatusText.setTextColor(AppTheme.muted(dark));
+  LinearLayout.LayoutParams lsp = new LinearLayout.LayoutParams(-2, -2);
+  lsp.topMargin = dp(12);
+  loadingBox.addView(loadingStatusText, lsp);
+  loadingOverlay.addView(loadingBox, new FrameLayout.LayoutParams(-2, -2, Gravity.CENTER));
+  loadingOverlay.setVisibility(GONE);
+  stage.addView(loadingOverlay, new FrameLayout.LayoutParams(-1, -1));
 
   cards = new LinearLayout(context);
   cards.setOrientation(VERTICAL);
@@ -226,19 +278,67 @@ final class JdPage extends LinearLayout {
   pullLp.topMargin = dp(12);
   stage.addView(pullBanner, pullLp);
 
-  scripts[PROVIDER_JD] = loadAsset(context, "jd-orders.js");
-  scripts[PROVIDER_SF] = loadAsset(context, "sf-orders.js");
-  scripts[PROVIDER_DY] = loadAsset(context, "dy-orders.js");
+  postDelayed(this::syncCookiesOnStartup, 400);
   updateModeUi();
   renderSummary(true);
   setDark(false);
+ }
+
+ private String getScript(int provider) {
+  if (provider < 0 || provider >= PROVIDER_COUNT) return "";
+  if (scripts[provider] == null || scripts[provider].isEmpty()) {
+   Context ctx = getContext();
+   if (provider == PROVIDER_JD) scripts[provider] = loadAsset(ctx, "jd-orders.js");
+   else if (provider == PROVIDER_SF) scripts[provider] = loadAsset(ctx, "sf-mobile-layout.js") + "\n" + loadAsset(ctx, "sf-orders.js");
+   else if (provider == PROVIDER_DY) scripts[provider] = loadAsset(ctx, "dy-orders.js");
+   else if (provider == PROVIDER_JDL) scripts[provider] = loadAsset(ctx, "jdl-orders.js");
+  }
+  return scripts[provider];
+ }
+
+ private void syncCookiesOnStartup() {
+  if (destroyed) return;
+  try {
+   clearLegacyDyFakeCookie();
+   getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE)
+    .edit().remove("jd_all_cookies").apply();
+   if (!hasDySessionCookie(buildDyCookieHeader())) restoreDySessionCookie();
+   if (providerSignedIn[PROVIDER_JD] && CookieManager.getInstance().getCookie(JdUrlPolicy.ORDERS) == null) {
+    providerSignedIn[PROVIDER_JD] = false;
+    providerOrders[PROVIDER_JD] = new JSONArray();
+    renderSummary(false);
+   }
+   if (providerSignedIn[PROVIDER_SF] && CookieManager.getInstance().getCookie(JdUrlPolicy.SF_ORDERS) == null) {
+    providerSignedIn[PROVIDER_SF] = false;
+    providerOrders[PROVIDER_SF] = new JSONArray();
+    renderSummary(false);
+   }
+   if (providerSignedIn[PROVIDER_JDL] && CookieManager.getInstance().getCookie(JdUrlPolicy.JDL_ORDERS) == null) {
+    providerSignedIn[PROVIDER_JDL] = false;
+    providerOrders[PROVIDER_JDL] = new JSONArray();
+    renderSummary(false);
+   }
+   if (providerSignedIn[PROVIDER_DY] && !hasDyWebSessionCookie() && !hasDySessionCookie(buildDyCookieHeader())) {
+    providerSignedIn[PROVIDER_DY] = false;
+    providerOrders[PROVIDER_DY] = new JSONArray();
+    renderSummary(false);
+   }
+  } catch (Exception ignored) {}
  }
 
  private void loadCachedState() {
   try {
    clearLegacyDyFakeCookie();
    SharedPreferences prefs = getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE);
+   if (prefs.contains("sf_login_user") || prefs.contains("sf_all_cookies")) {
+    prefs.edit().remove("sf_login_user").remove("sf_all_cookies").apply();
+   }
+   if (prefs.contains("cn_ready") || prefs.contains("cn_barcode") || prefs.contains("signed_" + LEGACY_CN_SLOT)) {
+    prefs.edit().remove("cn_phone").remove("cn_expiry").remove("cn_barcode").remove("cn_ready")
+     .remove("signed_" + LEGACY_CN_SLOT).remove("orders_" + LEGACY_CN_SLOT).apply();
+   }
    for (int p = 0; p < PROVIDER_COUNT; p++) {
+    if (p == LEGACY_CN_SLOT) continue;
     providerSignedIn[p] = prefs.getBoolean("signed_" + p, false);
     String raw = prefs.getString("orders_" + p, "[]");
     try {
@@ -247,38 +347,18 @@ final class JdPage extends LinearLayout {
      providerOrders[p] = new JSONArray();
     }
    }
-   if (prefs.getInt("jd_risk_clean_ver", 0) < 50) {
-    clearJdRiskCookiesOnly();
-    prefs.edit().putInt("jd_risk_clean_ver", 50).apply();
+   JSONArray savedCodes = new JSONArray(prefs.getString(PREF_MANUAL_JDL_CODES, "[]"));
+   for (int i = 0; i < savedCodes.length(); i++) {
+    JSONObject row = savedCodes.optJSONObject(i);
+    if (row != null && isPickupCode(row.optString("code"))) manualJdlCodes.put(row);
    }
-   if (prefs.getInt("dy_sf_auth_clean_ver", 0) < 51) {
-    clearStaleDySnsCookies();
-    if (!hasDyWebSessionCookie()) {
-     providerSignedIn[PROVIDER_DY] = false;
-     providerOrders[PROVIDER_DY] = new JSONArray();
-     dyLoginCompleted = false;
-    }
-    prefs.edit()
-     .putInt("dy_sf_auth_clean_ver", 51)
-     .putBoolean("signed_" + PROVIDER_DY, providerSignedIn[PROVIDER_DY])
-     .putString("orders_" + PROVIDER_DY, providerOrders[PROVIDER_DY].toString())
-     .apply();
-   }
-   restoreSfSessionCookie();
-   if (providerSignedIn[PROVIDER_JD] && !hasJdSessionCookie()) {
-    providerSignedIn[PROVIDER_JD] = false;
-    providerOrders[PROVIDER_JD] = new JSONArray();
-   }
-   if (providerSignedIn[PROVIDER_SF] && !hasSfSessionCookie()) {
-    providerSignedIn[PROVIDER_SF] = false;
-    providerOrders[PROVIDER_SF] = new JSONArray();
-   }
-   if (hasDyWebSessionCookie() || hasDySessionCookie(buildDyCookieHeader())) {
-    dyLoginCompleted = providerSignedIn[PROVIDER_DY];
-   } else if (providerSignedIn[PROVIDER_DY]) {
-    providerSignedIn[PROVIDER_DY] = false;
-    providerOrders[PROVIDER_DY] = new JSONArray();
-    dyLoginCompleted = false;
+   JSONArray savedTaobaoOrders = new JSONArray(prefs.getString(PREF_TAOBAO_ORDER_CODES, "[]"));
+   for (int i = 0; i < savedTaobaoOrders.length() && i < MAX_TAOBAO_ORDERS; i++) {
+    JSONObject entry = savedTaobaoOrders.optJSONObject(i);
+    if (entry == null) continue;
+    String orderKey = entry.optString("orderKey");
+    JSONArray codes = validTaobaoOrderCodes(entry.optJSONArray("codes"));
+    if (validTaobaoOrderKey(orderKey) && codes.length() > 0) taobaoOrderCodes.put(orderKey, codes);
    }
   } catch (Exception ignored) {}
  }
@@ -293,19 +373,7 @@ final class JdPage extends LinearLayout {
   } catch (Exception ignored) {}
  }
 
- private void clearStaleDySnsCookies() {
-  try {
-   CookieManager cm = CookieManager.getInstance();
-   String[] keys = {"sessionid", "sessionid_ss", "sid_tt", "uid_tt", "uid_tt_ss", "sid_guard", "sid_ucp_v1", "ssid_ucp_v1"};
-   for (String k : keys) {
-    cm.setCookie("https://is.snssdk.com", k + "=; Path=/; Max-Age=0; Secure; SameSite=None");
-    cm.setCookie("https://is.snssdk.com", k + "=; Path=/; Domain=.snssdk.com; Max-Age=0; Secure; SameSite=None");
-   }
-  } catch (Exception ignored) {}
- }
-
  private void clearAllDySessionCookies() {
-  clearStaleDySnsCookies();
   try {
    CookieManager cm = CookieManager.getInstance();
    String[] keys = {"sessionid", "sessionid_ss", "sid_tt", "uid_tt", "uid_tt_ss", "sid_guard", "sid_ucp_v1", "ssid_ucp_v1", "X-Xiaodian-Token"};
@@ -314,6 +382,8 @@ final class JdPage extends LinearLayout {
     cm.setCookie("https://www.douyin.com", k + "=; Path=/; Domain=.douyin.com; Max-Age=0; Secure; SameSite=None");
     cm.setCookie("https://sso.douyin.com", k + "=; Path=/; Max-Age=0; Secure; SameSite=None");
     cm.setCookie("https://ec.snssdk.com", k + "=; Path=/; Max-Age=0; Secure; SameSite=None");
+    cm.setCookie("https://is.snssdk.com", k + "=; Path=/; Max-Age=0; Secure; SameSite=None");
+    cm.setCookie("https://is.snssdk.com", k + "=; Path=/; Domain=.snssdk.com; Max-Age=0; Secure; SameSite=None");
     cm.setCookie("https://haohuo.jinritemai.com", k + "=; Path=/; Max-Age=0; Secure; SameSite=None");
     cm.setCookie("https://haohuo.jinritemai.com", k + "=; Path=/; Domain=.jinritemai.com; Max-Age=0; Secure; SameSite=None");
    }
@@ -341,11 +411,6 @@ final class JdPage extends LinearLayout {
 
  private void clearStaleSfCookies() {
   try {
-   getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE)
-    .edit()
-    .remove("sf_login_user")
-    .remove("sf_all_cookies")
-    .apply();
    CookieManager cm = CookieManager.getInstance();
    String url = "https://www.sf-express.com";
    String[] keys = {"loginUser", "remember-me", "SESSION", "sessionId", "token"};
@@ -361,38 +426,21 @@ final class JdPage extends LinearLayout {
   } catch (Exception ignored) {}
  }
 
- private void clearJdRiskCookiesOnly() {
-  try {
-   CookieManager cm = CookieManager.getInstance();
-   String[] urls = {"https://trade.m.jd.com", "https://m.jd.com", "https://my.m.jd.com", "https://api.m.jd.com"};
-   String[] riskKeys = {"cd_eid", "3AB9D23F7A4B3C9B", "gia_d", "_gia_d", "shshshfp", "shshshfpa", "shshshfpb"};
-   for (String u : urls) {
-    for (String k : riskKeys) {
-     cm.setCookie(u, k + "=; Path=/; Max-Age=0");
-     cm.setCookie(u, k + "=; Path=/; Domain=.jd.com; Max-Age=0");
-    }
-   }
-  } catch (Exception ignored) {}
- }
-
  private void saveCachedState() {
   try {
    SharedPreferences.Editor ed = getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE).edit();
    for (int p = 0; p < PROVIDER_COUNT; p++) {
+    if (p == LEGACY_CN_SLOT) continue;
     ed.putBoolean("signed_" + p, providerSignedIn[p]);
     ed.putString("orders_" + p, providerOrders[p] != null ? providerOrders[p].toString() : "[]");
    }
    ed.apply();
-   if (providerSignedIn[PROVIDER_SF]) {
-    persistSfSessionCookie();
-   } else {
-    getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE)
-     .edit()
-     .remove("sf_login_user")
-     .remove("sf_all_cookies")
-     .apply();
-   }
   } catch (Exception ignored) {}
+   if (providerSignedIn[PROVIDER_DY]) {
+    persistDySessionCookie();
+   } else {
+    clearDySavedCookies();
+   }
  }
 
  private String loadAsset(Context context, String name) {
@@ -449,13 +497,21 @@ final class JdPage extends LinearLayout {
   setBackgroundColor(AppTheme.bg(dark));
   tools.setBackgroundColor(AppTheme.surface(dark));
   status.setTextColor(AppTheme.muted(dark));
-  for (Button b : new Button[]{backToSummaryBtn, switchSoftwareBtn, refreshBtn}) {
+  for (Button b : new Button[]{backToSummaryBtn, switchSoftwareBtn, refreshBtn, providerOptionsBtn, dySmsBtn}) {
    b.setTextColor(b == backToSummaryBtn ? Color.WHITE : AppTheme.ink(dark));
    b.setBackground(roundBg(b == backToSummaryBtn ? AppTheme.ACCENT : AppTheme.subtleFill(dark), 10));
   }
   results.setBackgroundColor(AppTheme.bg(dark));
   for (WebView w : webs) if (w != null) w.setBackgroundColor(AppTheme.bg(dark));
+  if (loadingOverlay != null) {
+   loadingOverlay.setBackgroundColor(AppTheme.bg(dark));
+   if (loadingStatusText != null) loadingStatusText.setTextColor(AppTheme.muted(dark));
+  }
   renderSummary(true);
+ }
+
+ private static boolean isWebProvider(int provider) {
+  return provider >= PROVIDER_JD && provider < PROVIDER_COUNT && provider != LEGACY_CN_SLOT;
  }
 
  int getMode() { return mode; }
@@ -464,9 +520,21 @@ final class JdPage extends LinearLayout {
   return provider >= 0 && provider < PROVIDER_COUNT && providerSignedIn[provider];
  }
 
+ boolean isPlatformSignedIn(int provider) {
+  return isSignedIn(provider) || (provider == PROVIDER_JD && isSignedIn(PROVIDER_JDL));
+ }
+
+ int countForPlatform(int provider) {
+  if (provider == PROVIDER_TB) return taobaoPickupRows().size();
+  return countFor(provider) + (provider == PROVIDER_JD ? countFor(PROVIDER_JDL) : 0);
+ }
+
  boolean isAnyManagedSignedIn() {
-  if (mode >= PROVIDER_JD && mode <= PROVIDER_DY) return providerSignedIn[mode];
-  return providerSignedIn[PROVIDER_JD] || providerSignedIn[PROVIDER_SF] || providerSignedIn[PROVIDER_DY];
+  if (mode >= PROVIDER_JD && mode < PROVIDER_COUNT) return providerSignedIn[mode];
+  for (int provider = PROVIDER_JD; provider < PROVIDER_COUNT; provider++) {
+   if (providerSignedIn[provider]) return true;
+  }
+  return false;
  }
 
  int countFor(int provider) {
@@ -485,12 +553,13 @@ final class JdPage extends LinearLayout {
   if (provider != PROVIDER_TB && provider != PROVIDER_PDD) return;
   boolean changed = providerSignedIn[provider] != signedIn;
   providerSignedIn[provider] = signedIn;
-  JSONArray next = signedIn && orders != null ? orders : new JSONArray();
-  String prevStr = providerOrders[provider] != null ? providerOrders[provider].toString() : "[]";
-  String nextStr = next.toString();
-  if (!prevStr.equals(nextStr)) {
-   providerOrders[provider] = next;
-   changed = true;
+  if (!signedIn || orders != null) {
+   JSONArray next = signedIn ? orders : new JSONArray();
+   String prevStr = providerOrders[provider] != null ? providerOrders[provider].toString() : "[]";
+   if (!prevStr.equals(next.toString())) {
+    providerOrders[provider] = next;
+    changed = true;
+   }
   }
   if (changed) {
    saveCachedState();
@@ -506,32 +575,42 @@ final class JdPage extends LinearLayout {
  void warmBackground() {
   if (destroyed) return;
   paused = false;
-  if (webContainer.getWidth() <= 0 || webContainer.getHeight() <= 0) {
-   postDelayed(() -> {
-    if (!destroyed) {
-     ensureWeb(PROVIDER_JD);
-     ensureWeb(PROVIDER_SF);
-     ensureWeb(PROVIDER_DY);
-    }
-   }, 250);
-   return;
-  }
-  ensureWeb(PROVIDER_JD);
-  ensureWeb(PROVIDER_SF);
-  ensureWeb(PROVIDER_DY);
+  warmBackgroundProgressive();
+ }
+
+ void warmBackgroundProgressive() {
+  if (destroyed || paused) return;
+  postDelayed(() -> {
+   if (destroyed || paused) return;
+   if (providerSignedIn[PROVIDER_JD]) ensureWeb(PROVIDER_JD);
+  }, 200);
+  postDelayed(() -> {
+   if (destroyed || paused) return;
+   if (providerSignedIn[PROVIDER_SF]) ensureWeb(PROVIDER_SF);
+  }, 600);
+  postDelayed(() -> {
+   if (destroyed || paused) return;
+   if (providerSignedIn[PROVIDER_DY]) ensureWeb(PROVIDER_DY);
+  }, 1000);
+  postDelayed(() -> {
+   if (destroyed || paused) return;
+   if (providerSignedIn[PROVIDER_JDL]) ensureWeb(PROVIDER_JDL);
+  }, 1250);
  }
 
  void showPage() {
   if (destroyed) return;
   paused = false;
   activeTab = true;
-  ensureWeb(PROVIDER_JD);
-  ensureWeb(PROVIDER_SF);
-  ensureWeb(PROVIDER_DY);
-  for (int p = PROVIDER_JD; p <= PROVIDER_DY; p++) {
+  for (int p = PROVIDER_JD; p < PROVIDER_COUNT; p++) {
    if (webs[p] != null) webs[p].onResume();
   }
   updateModeUi();
+  if (mode != MODE_SUMMARY) {
+   ensureWeb(mode);
+  } else {
+   warmBackgroundProgressive();
+  }
   sampleAll();
   schedule();
  }
@@ -542,40 +621,27 @@ final class JdPage extends LinearLayout {
    externalSwitch.accept(provider);
    return;
   }
-  if (provider < PROVIDER_JD || provider > PROVIDER_DY) {
+  if (!isWebProvider(provider)) {
    showSummary();
    return;
   }
-  showPage();
   mode = provider;
-  pendingAutoSummary[provider] = !providerSignedIn[provider];
+  paused = false;
+  activeTab = true;
+  if (provider == PROVIDER_JD) jdLoginRedirected = false;
+  pendingAutoSummary[provider] = provider != PROVIDER_SF && provider != PROVIDER_JDL && !providerSignedIn[provider];
   ensureWeb(provider);
   if (webs[provider] != null) {
+   webs[provider].onResume();
    String curUrl = webs[provider].getUrl();
    if (provider == PROVIDER_JD) {
-    if (!providerSignedIn[PROVIDER_JD] && !hasJdSessionCookie()) {
-     if (curUrl == null || !curUrl.contains("plogin.m.jd.com")) {
-      webs[PROVIDER_JD].loadUrl(JdUrlPolicy.LOGIN);
-     }
-    } else if (!providerErrors[PROVIDER_JD].isEmpty()
-      || (jdPreferMyHome && curUrl != null && curUrl.contains("trade.m.jd.com"))) {
-     providerErrors[PROVIDER_JD] = "";
-     loadProviderEntry(PROVIDER_JD, webs[PROVIDER_JD]);
-    }
-   } else if (provider == PROVIDER_SF && !providerSignedIn[PROVIDER_SF]) {
-    if (curUrl == null || !curUrl.contains("sf-express.com")) {
-     sfPendingOpenLogin = true;
-     webs[PROVIDER_SF].loadUrl(JdUrlPolicy.SF_ORDERS);
-    } else {
-     webs[PROVIDER_SF].evaluateJavascript("if(window.HandySfOrders&&window.HandySfOrders.openLogin)window.HandySfOrders.openLogin();", null);
-    }
+    if (!providerErrors[PROVIDER_JD].isEmpty()) reloadProvider(PROVIDER_JD);
    } else if (provider == PROVIDER_DY) {
-    if (!providerSignedIn[PROVIDER_DY]) {
-     dyApiHistory.clear();
-     if (curUrl == null || !curUrl.contains("douyin.com/user/self")) {
+    if (!providerSignedIn[PROVIDER_DY] && !dyOrderNeedsAuthorization && !hasDyAccountSession()) {
+     if (!JdUrlPolicy.isDyLoginPage(curUrl)) {
       loadDyUrl(webs[PROVIDER_DY], JdUrlPolicy.DY_LOGIN);
      }
-    } else if (curUrl == null || !curUrl.contains("haohuo.jinritemai.com")) {
+    } else if (curUrl == null || curUrl.isEmpty() || "about:blank".equals(curUrl)) {
      loadDyUrl(webs[PROVIDER_DY], JdUrlPolicy.DY_ORDERS);
     }
    }
@@ -595,46 +661,153 @@ final class JdPage extends LinearLayout {
  }
 
  private void updateModeUi() {
+  boolean summary = mode == MODE_SUMMARY;
+  tools.setOrientation(summary ? HORIZONTAL : VERTICAL);
+  LinearLayout.LayoutParams statusLp = summary ? new LinearLayout.LayoutParams(0, -2, 1f)
+   : new LinearLayout.LayoutParams(-1, -2);
+  if (summary) statusLp.setMarginEnd(dp(8));
+  else statusLp.bottomMargin = dp(6);
+  status.setLayoutParams(statusLp);
+  toolButtons.setLayoutParams(new LinearLayout.LayoutParams(summary ? -2 : -1, -2));
+  toolSpace.setVisibility(summary ? GONE : VISIBLE);
+  updateDySmsAction();
+  providerOptionsBtn.setVisibility(mode == PROVIDER_SF || mode == PROVIDER_JDL ? VISIBLE : GONE);
+  refreshBtn.setEnabled(mode != PROVIDER_SF || !resettingSfLogin);
   if (mode == MODE_SUMMARY) {
    results.setVisibility(VISIBLE);
    backToSummaryBtn.setVisibility(GONE);
    switchSoftwareBtn.setVisibility(VISIBLE);
    refreshBtn.setText("刷新全部");
-   for (int p = PROVIDER_JD; p <= PROVIDER_DY; p++) {
+   for (int p = PROVIDER_JD; p < PROVIDER_COUNT; p++) {
     if (webs[p] != null) webs[p].setVisibility(INVISIBLE);
    }
+   if (loadingOverlay != null) loadingOverlay.setVisibility(GONE);
    updateSummaryStatusText();
   } else {
    results.setVisibility(GONE);
    backToSummaryBtn.setVisibility(VISIBLE);
    switchSoftwareBtn.setVisibility(GONE);
    refreshBtn.setText("刷新网页");
-   for (int p = PROVIDER_JD; p <= PROVIDER_DY; p++) {
+   for (int p = PROVIDER_JD; p < PROVIDER_COUNT; p++) {
     if (webs[p] != null) webs[p].setVisibility(p == mode ? VISIBLE : INVISIBLE);
    }
-   String pName = PROVIDER_NAMES[mode];
+   if (loadingOverlay != null) {
+    if (!pageCommitted[mode]) {
+     loadingOverlay.setAlpha(1f);
+     loadingOverlay.setVisibility(VISIBLE);
+     if (loadingStatusText != null) {
+      loadingStatusText.setText("\u6b63\u5728\u52a0\u8f7d " + PROVIDER_NAMES[mode] + " \u5b98\u65b9\u5b89\u5168\u9875\u9762\u2026");
+     }
+    } else {
+     loadingOverlay.setVisibility(GONE);
+    }
+   }
    if (!providerErrors[mode].isEmpty()) {
     status.setText(providerErrors[mode]);
    } else if (providerSignedIn[mode]) {
-    status.setText("已登录" + pName + "（已识别 " + countFor(mode) + " 个取件码），可点「‹ 返回汇总」。");
+    status.setText(signedInStatus(mode));
    } else {
-    status.setText("请在" + pName + "官方页面完成登录，登录完后将自动拉取并汇总。");
+    status.setText(loginHint(mode));
    }
   }
   notifySessionState();
  }
 
+ private String signedInStatus(int provider) {
+  return "已登录" + PROVIDER_NAMES[provider] + " · " + countFor(provider) + " 个取件码";
+ }
+
+ private String loginHint(int provider) {
+  if (provider == PROVIDER_JDL) return "登录后可在「我收的」查件，也可从「更多」打开浏览器。";
+  if (provider == PROVIDER_SF) return resettingSfLogin ? "正在清理顺丰的登录数据…"
+   : "请在顺丰官网登录。验证码报错时，可从「更多」重置登录。";
+  if (provider == PROVIDER_DY) return dySmsLoginOffered ? "可使用抖音官网的验证码登录。"
+   : "请在抖音官网选择登录方式。";
+  return "请在" + PROVIDER_NAMES[provider] + "官方页面完成登录，登录完后将自动拉取并汇总。";
+ }
+
+ private void updateDySmsAction() {
+  dySmsBtn.setVisibility(mode == PROVIDER_DY && dySmsLoginOffered ? VISIBLE : GONE);
+ }
+
+ private void openDySmsLogin() {
+  WebView web = webs[PROVIDER_DY];
+  if (mode != PROVIDER_DY || !dySmsLoginOffered || web == null || !JdUrlPolicy.isDyLoginPage(web.getUrl())) return;
+  web.evaluateJavascript("window.HandyDyOrders && HandyDyOrders.openSmsLogin()", null);
+ }
+
  private String entryUrl(int provider) {
-  if (provider == PROVIDER_JD) return jdPreferMyHome ? JdUrlPolicy.MY_HOME : JdUrlPolicy.ORDERS;
+  if (provider == PROVIDER_JD) return JdUrlPolicy.ORDERS;
   if (provider == PROVIDER_SF) return JdUrlPolicy.SF_ORDERS;
+  if (provider == PROVIDER_JDL) return JdUrlPolicy.JDL_ORDERS;
   return JdUrlPolicy.DY_ORDERS;
+ }
+
+ private void openProviderInBrowser() {
+  if (mode != PROVIDER_SF && mode != PROVIDER_JDL) return;
+  try {
+   android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW,
+    android.net.Uri.parse(entryUrl(mode)));
+   intent.addCategory(android.content.Intent.CATEGORY_BROWSABLE);
+   getContext().startActivity(intent);
+  } catch (android.content.ActivityNotFoundException | SecurityException unavailable) {
+   Toast.makeText(getContext(), "未找到可打开官网的浏览器", Toast.LENGTH_SHORT).show();
+  }
+ }
+
+ private void showProviderOptions() {
+  if (mode != PROVIDER_SF && mode != PROVIDER_JDL) return;
+  PopupMenu popup = new PopupMenu(getContext(), providerOptionsBtn);
+  popup.getMenu().add(0, 1, 0, "在浏览器打开");
+  if (mode == PROVIDER_SF) popup.getMenu().add(0, 2, 1, "重置顺丰登录").setEnabled(!resettingSfLogin);
+  popup.setOnMenuItemClickListener(item -> {
+   if (item.getItemId() == 1) openProviderInBrowser();
+   if (item.getItemId() == 2) showSfLoginReset();
+   return true;
+  });
+  popup.show();
+ }
+
+ private void showSfLoginReset() {
+  if (destroyed || mode != PROVIDER_SF || resettingSfLogin || SiteDataClearer.isBusy()) return;
+  new AlertDialog.Builder(getContext())
+   .setTitle("重新登录顺丰")
+   .setMessage("清理 HandyCode 内的顺丰登录数据，然后重新打开顺丰官网。")
+   .setNegativeButton("取消", null)
+   .setPositiveButton("清理并打开", (dialog, which) -> resetSfLogin())
+   .show();
+ }
+
+ private void resetSfLogin() {
+  if (destroyed || resettingSfLogin || SiteDataClearer.isBusy()) return;
+  resettingSfLogin = true;
+  if (mode == PROVIDER_SF) refreshBtn.setEnabled(false);
+  resetProviderSession(PROVIDER_SF);
+  if (mode == PROVIDER_SF) status.setText(loginHint(PROVIDER_SF));
+  if (!SiteDataClearer.isSupported()) {
+   finishSfLoginReset(false);
+   return;
+  }
+  SiteDataClearer.clearSites(LogoutSites.forPickupProvider(PROVIDER_SF),
+   () -> finishSfLoginReset(true), error -> finishSfLoginReset(false));
+ }
+
+ private void finishSfLoginReset(boolean clearedSite) {
+  if (destroyed) return;
+  resettingSfLogin = false;
+  refreshBtn.setEnabled(true);
+  if (mode == PROVIDER_SF && activeTab && !paused) openProvider(PROVIDER_SF);
+  if (!clearedSite) Toast.makeText(getContext(),
+   "未能完整清理顺丰的网页登录数据。可更新系统 WebView 后重试。", Toast.LENGTH_LONG).show();
  }
 
  private void loadDyUrl(WebView web, String url) {
   if (web == null || url == null) return;
-  boolean useDesktop = url.contains("douyin.com");
-  String targetUa = useDesktop ? DY_DESKTOP_UA : (dyMobileUa != null && !dyMobileUa.isEmpty() ? dyMobileUa : DY_DESKTOP_UA);
+  boolean loginPage = JdUrlPolicy.isDyLoginPage(url);
+  String targetUa = loginPage ? DY_DESKTOP_UA : (dyMobileUa != null && !dyMobileUa.isEmpty() ? dyMobileUa : DY_DESKTOP_UA);
   WebSettings ws = web.getSettings();
+  ws.setUseWideViewPort(!loginPage);
+  ws.setLoadWithOverviewMode(!loginPage);
   if (!targetUa.equals(ws.getUserAgentString())) {
    ws.setUserAgentString(targetUa);
   }
@@ -643,23 +816,17 @@ final class JdPage extends LinearLayout {
 
  private void loadProviderEntry(int provider, WebView web) {
   if (web == null) return;
-  if (provider == PROVIDER_JD) {
-   String target = entryUrl(PROVIDER_JD);
-   Map<String, String> headers = new HashMap<>();
-   headers.put("Referer", jdPreferMyHome ? "https://m.jd.com/" : JdUrlPolicy.MY_HOME);
-   web.loadUrl(target, headers);
-  } else if (provider == PROVIDER_DY) {
+  if (provider == PROVIDER_DY) {
    String cur = web.getUrl();
-   boolean onDyLogin = cur != null && cur.contains("douyin.com");
-   if (!providerSignedIn[PROVIDER_DY] && (onDyLogin || (!hasDySessionCookie(buildDyCookieHeader()) && mode == PROVIDER_DY))) {
+   boolean onDyLogin = JdUrlPolicy.isDyLoginPage(cur);
+   boolean signed = providerSignedIn[PROVIDER_DY] || hasDySessionCookie(buildDyCookieHeader());
+   if (onDyLogin) {
+    web.reload();
+   } else if (!signed && mode == PROVIDER_DY) {
     loadDyUrl(web, JdUrlPolicy.DY_LOGIN);
    } else {
-    syncDyCookiesAcrossDomains();
     loadDyUrl(web, JdUrlPolicy.DY_ORDERS);
    }
-  } else if (provider == PROVIDER_SF) {
-   restoreSfSessionCookie();
-   web.loadUrl(entryUrl(provider));
   } else {
    web.loadUrl(entryUrl(provider));
   }
@@ -707,11 +874,14 @@ final class JdPage extends LinearLayout {
  private boolean allowedUrl(int provider, String url) {
   if (provider == PROVIDER_JD) return JdUrlPolicy.allowed(url);
   if (provider == PROVIDER_SF) return JdUrlPolicy.allowedSf(url);
+  if (provider == PROVIDER_JDL) return JdUrlPolicy.allowedJdlOrders(url);
   return JdUrlPolicy.allowedDy(url);
  }
 
  private void ensureWeb(final int provider) {
-  if (destroyed || webs[provider] != null || scripts[provider] == null || scripts[provider].isEmpty()) return;
+  String script = getScript(provider);
+  if (destroyed || webs[provider] != null || script == null || script.isEmpty()) return;
+  if (provider == PROVIDER_SF && resettingSfLogin) return;
   WebView web = new WebView(getContext());
   webs[provider] = web;
   web.setBackgroundColor(AppTheme.bg(dark));
@@ -729,15 +899,24 @@ final class JdPage extends LinearLayout {
   s.setLoadWithOverviewMode(true);
   s.setJavaScriptCanOpenWindowsAutomatically(false);
   s.setSupportMultipleWindows(false);
-  String defaultUa = s.getUserAgentString();
-  if (defaultUa != null && !defaultUa.isEmpty()) {
-   String cleanUa = defaultUa.replace("; wv)", ")").replace("; wv;", ";").replace("Version/4.0 ", "");
-   s.setUserAgentString(cleanUa);
-   if (provider == PROVIDER_DY) dyMobileUa = cleanUa;
+  if (provider == PROVIDER_JD) s.setTextZoom(100);
+  if (provider == PROVIDER_DY) {
+   String defaultUa = s.getUserAgentString();
+   if (defaultUa != null && !defaultUa.isEmpty()) {
+    String cleanUa = defaultUa.replace("; wv)", ")").replace("; wv;", ";").replace("Version/4.0 ", "");
+    s.setUserAgentString(cleanUa);
+    if (provider == PROVIDER_DY) dyMobileUa = cleanUa;
+   }
+   configureModernWebSettings(s);
   }
-  configureModernWebSettings(s);
   CookieManager.getInstance().setAcceptCookie(true);
-  CookieManager.getInstance().setAcceptThirdPartyCookies(web, true);
+  CookieManager.getInstance().setAcceptThirdPartyCookies(web, provider != PROVIDER_JD);
+  boolean installJdEarly = false;
+  if (provider == PROVIDER_JD && WebViewFeature.isFeatureSupported("DOCUMENT_START_SCRIPT")) {
+   WebViewCompat.addDocumentStartJavaScript(web, script, JD_ORDER_ORIGINS);
+   installJdEarly = true;
+  }
+  final boolean jdDocumentStart = installJdEarly;
   web.setWebChromeClient(new WebChromeClient() {
    @Override public void onPermissionRequest(PermissionRequest r) { r.deny(); }
    @Override public boolean onConsoleMessage(ConsoleMessage cm) {
@@ -771,45 +950,55 @@ final class JdPage extends LinearLayout {
     return !allowedUrl(provider, url);
    }
    @Override public void onPageStarted(WebView v, String url, android.graphics.Bitmap icon) {
+    if (destroyed || webs[provider] != v) return;
     generations[provider]++;
     inFlight[provider] = false;
-    if (provider == PROVIDER_DY && url != null && (url.contains("/passport/") || url.contains("douyin.com"))) {
-     dyApiHistory.clear();
+    pageCommitted[provider] = false;
+    if (mode == provider && loadingOverlay != null) {
+     loadingOverlay.setAlpha(1f);
+     loadingOverlay.setVisibility(VISIBLE);
+     if (loadingStatusText != null) {
+      loadingStatusText.setText("\u6b63\u5728\u52a0\u8f7d " + PROVIDER_NAMES[provider] + " \u5b98\u65b9\u5b89\u5168\u9875\u9762\u2026");
+     }
+    }
+    if (provider == PROVIDER_DY) {
+     invalidateDyApiHistory();
+     dySmsLoginOffered = false;
+     updateDySmsAction();
     }
     if (!allowedUrl(provider, url)) {
      v.stopLoading();
      if (mode == provider) status.setText("已拦截非官方安全链接。");
      return;
     }
-    if (provider == PROVIDER_DY && url != null && url.contains("douyin.com")) {
-     v.evaluateJavascript("try{Object.defineProperty(navigator,'webdriver',{get:function(){return false;}});}catch(e){}", null);
-    }
-    v.evaluateJavascript(scripts[provider], null);
+    if (provider == PROVIDER_JD && !jdDocumentStart) v.evaluateJavascript(script, null);
    }
    @Override public void onPageCommitVisible(WebView v, String url) {
+    if (destroyed || webs[provider] != v) return;
+    pageCommitted[provider] = true;
+    if (mode == provider && loadingOverlay != null && loadingOverlay.getVisibility() == VISIBLE) {
+     loadingOverlay.animate().alpha(0f).setDuration(160).withEndAction(() -> loadingOverlay.setVisibility(GONE)).start();
+    }
     if (allowedUrl(provider, url)) {
      v.evaluateJavascript(scripts[provider], null);
     }
    }
    @Override public WebResourceResponse shouldInterceptRequest(WebView v, WebResourceRequest r) {
-    if (provider == PROVIDER_DY && r != null && r.getUrl() != null) {
-     WebResourceResponse resp = interceptDyEcRequest(v, r);
+    if (provider == PROVIDER_DY && r != null && !r.isForMainFrame() && r.getUrl() != null) {
+     WebResourceResponse resp = interceptDyEcRequest(r);
      if (resp != null) return resp;
     }
     return super.shouldInterceptRequest(v, r);
    }
    @Override public void onPageFinished(WebView v, String url) {
+    if (destroyed || webs[provider] != v) return;
+    pageCommitted[provider] = true;
+    if (mode == provider && loadingOverlay != null && loadingOverlay.getVisibility() == VISIBLE) {
+     loadingOverlay.animate().alpha(0f).setDuration(160).withEndAction(() -> loadingOverlay.setVisibility(GONE)).start();
+    }
     CookieManager.getInstance().flush();
     if (allowedUrl(provider, url)) {
      v.evaluateJavascript(buildProviderEvalScript(provider), null);
-     if (provider == PROVIDER_SF && sfPendingOpenLogin) {
-      sfPendingOpenLogin = false;
-      postDelayed(() -> {
-       if (mode == PROVIDER_SF && webs[PROVIDER_SF] != null) {
-        webs[PROVIDER_SF].evaluateJavascript("if(window.HandySfOrders&&window.HandySfOrders.openLogin)window.HandySfOrders.openLogin();", null);
-       }
-      }, 400);
-     }
      sampleProvider(provider);
      postDelayed(() -> sampleProvider(provider), 900);
      postDelayed(() -> sampleProvider(provider), 2200);
@@ -817,6 +1006,20 @@ final class JdPage extends LinearLayout {
    }
    @Override public void onReceivedSslError(WebView v, SslErrorHandler h, SslError e) {
     h.cancel();
+    if (provider == PROVIDER_JD && webs[provider] == v && Objects.equals(v.getUrl(), e.getUrl())) {
+     showJdOrderProblem("京东安全连接验证失败，请检查网络或手机日期。");
+    }
+   }
+   @Override public void onReceivedError(WebView v, WebResourceRequest request, WebResourceError error) {
+    if (provider == PROVIDER_JD && webs[provider] == v && request.isForMainFrame()) {
+     showJdOrderProblem("京东订单页暂时无法连接，请稍后刷新。");
+    }
+   }
+   @Override public void onReceivedHttpError(WebView v, WebResourceRequest request, WebResourceResponse response) {
+    if (provider == PROVIDER_JD && webs[provider] == v && request.isForMainFrame()) {
+     showJdOrderProblem(response.getStatusCode() == 429 ? "京东订单页当前繁忙，请稍后刷新。"
+      : "京东订单页暂时无法加载，请稍后刷新。");
+    }
    }
   });
   web.setVisibility(mode == provider ? VISIBLE : INVISIBLE);
@@ -826,13 +1029,14 @@ final class JdPage extends LinearLayout {
 
  private void onDySsoLoginSuccess() {
   post(() -> {
-   if (destroyed) return;
+   WebView web = webs[PROVIDER_DY];
+   if (destroyed || web == null || !JdUrlPolicy.isDyLoginPage(web.getUrl())
+       || !hasDySessionCookie(buildDyCookieHeader())) return;
    long now = android.os.SystemClock.elapsedRealtime();
    if (dyLoginSuccessAt > 0 && now - dyLoginSuccessAt < 3000) return;
-   dyLoginCompleted = true;
    dyLoginSuccessAt = now;
-   dyApiHistory.clear();
-   clearStaleDySnsCookies();
+   dyOrderNeedsAuthorization = false;
+   invalidateDyApiHistory();
    syncDyCookiesAcrossDomains();
    CookieManager.getInstance().flush();
    providerErrors[PROVIDER_DY] = "";
@@ -840,17 +1044,23 @@ final class JdPage extends LinearLayout {
    if (mode == PROVIDER_DY) {
     status.setText("已完成抖音账号验证，正在拉取抖音订单确认登录状态…");
    }
-   if (webs[PROVIDER_DY] != null) {
-    loadDyUrl(webs[PROVIDER_DY], JdUrlPolicy.DY_ORDERS);
-   }
+   loadDyUrl(web, JdUrlPolicy.DY_ORDERS);
   });
  }
 
  private void onDySessionExpired() {
   if (destroyed) return;
-  dyLoginCompleted = false;
+  if (hasDyAccountSession()) {
+   // The order endpoint does not establish whether the Douyin account itself signed out.
+   dyOrderNeedsAuthorization = true;
+   providerErrors[PROVIDER_DY] = DY_ORDER_LOGIN_HINT;
+   if (mode == PROVIDER_DY) status.setText(DY_ORDER_LOGIN_HINT);
+   return;
+  }
   dyLoginSuccessAt = 0L;
-  dyApiHistory.clear();
+  dyOrderNeedsAuthorization = false;
+  invalidateDyApiHistory();
+  clearDySavedCookies();
   boolean wasSigned = providerSignedIn[PROVIDER_DY];
   providerSignedIn[PROVIDER_DY] = false;
   providerErrors[PROVIDER_DY] = "";
@@ -892,12 +1102,8 @@ final class JdPage extends LinearLayout {
  }
 
  private void redirectToJdLoginIfNeeded(WebView v) {
-  if (v == null) return;
-  String cur = v.getUrl();
-  if (cur != null && cur.contains("plogin.m.jd.com")) return;
-  long now = android.os.SystemClock.elapsedRealtime();
-  if (now - lastJdLoginRedirect[0] < 5000) return;
-  lastJdLoginRedirect[0] = now;
+  if (jdLoginRedirected || JdUrlPolicy.isMallLoginPage(v.getUrl())) return;
+  jdLoginRedirected = true;
   pendingAutoSummary[PROVIDER_JD] = true;
   v.loadUrl(JdUrlPolicy.LOGIN);
  }
@@ -905,11 +1111,11 @@ final class JdPage extends LinearLayout {
  private void redirectToDyLoginIfNeeded(WebView v) {
   if (v == null) return;
   String cur = v.getUrl();
-  if (cur != null && cur.contains("douyin.com/user/self")) return;
+  if (JdUrlPolicy.isDyLoginPage(cur)) return;
   long now = android.os.SystemClock.elapsedRealtime();
   if (now - lastDySsoRedirect[0] < 4000) return;
   lastDySsoRedirect[0] = now;
-  dyApiHistory.clear();
+  invalidateDyApiHistory();
   pendingAutoSummary[PROVIDER_DY] = true;
   loadDyUrl(v, JdUrlPolicy.DY_LOGIN);
  }
@@ -977,14 +1183,6 @@ final class JdPage extends LinearLayout {
   return false;
  }
 
- private boolean hasJdSessionCookie() {
-  CookieManager cm = CookieManager.getInstance();
-  String c1 = cm.getCookie("https://trade.m.jd.com");
-  String c2 = cm.getCookie("https://m.jd.com");
-  return hasNonEmptyCookieKey(c1, "pt_key", "wq_skey", "thor", "wskey")
-   || hasNonEmptyCookieKey(c2, "pt_key", "wq_skey", "thor", "wskey");
- }
-
  private boolean hasDyWebSessionCookie() {
   CookieManager cm = CookieManager.getInstance();
   String c1 = cm.getCookie("https://www.douyin.com");
@@ -998,40 +1196,32 @@ final class JdPage extends LinearLayout {
    "sessionid", "sessionid_ss", "sid_tt", "sid_guard", "sid_ucp_v1", "ssid_ucp_v1", "X-Xiaodian-Token");
  }
 
- private String getCookieValue(String raw, String key) {
-  if (raw == null || raw.isEmpty() || key == null) return null;
-  for (String part : raw.split(";")) {
-   String kv = part.trim();
-   int eq = kv.indexOf('=');
-   if (eq <= 0) continue;
-   String k = kv.substring(0, eq).trim();
-   if (key.equals(k)) {
-    String val = kv.substring(eq + 1).trim();
-    if (!val.isEmpty() && !"null".equalsIgnoreCase(val) && !"undefined".equalsIgnoreCase(val) && !"deleted".equalsIgnoreCase(val) && !"0".equals(val)) {
-     return val;
-    }
-   }
-  }
-  return null;
+ private boolean hasDyAccountSession() {
+  return hasDyWebSessionCookie() || (dyLoginSuccessAt > 0
+   && android.os.SystemClock.elapsedRealtime() - dyLoginSuccessAt < 15000);
  }
 
- private boolean hasSfSessionCookie() {
-  String raw = CookieManager.getInstance().getCookie("https://www.sf-express.com");
-  return hasNonEmptyCookieKey(raw, "loginUser", "remember-me");
- }
-
- private void persistSfSessionCookie() {
+ private void persistDySessionCookie() {
   try {
    CookieManager cm = CookieManager.getInstance();
-   String raw = cm.getCookie("https://www.sf-express.com");
-   if (raw != null && !raw.isEmpty()) {
-    String val = getCookieValue(raw, "loginUser");
-    if (val != null && !val.isEmpty()) {
-     getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE)
-      .edit()
-      .putString("sf_login_user", val)
-      .putString("sf_all_cookies", raw)
-      .apply();
+   String[] domains = {"https://www.douyin.com", "https://sso.douyin.com", "https://ec.snssdk.com", "https://haohuo.jinritemai.com"};
+   StringBuilder all = new StringBuilder();
+   for (String d : domains) {
+    String raw = cm.getCookie(d);
+    if (raw != null && !raw.isEmpty()) {
+     if (all.length() > 0) all.append(";;");
+     all.append(d).append("::").append(raw);
+    }
+   }
+   String cookieStr = all.toString();
+   if (!cookieStr.isEmpty() && hasDyWebSessionCookie()) {
+    getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE)
+     .edit()
+     .putString("dy_all_cookies", cookieStr)
+     .apply();
+    for (String d : domains) {
+     String raw = cm.getCookie(d);
+     if (raw == null) continue;
      for (String part : raw.split(";")) {
       String kv = part.trim();
       int eq = kv.indexOf('=');
@@ -1039,37 +1229,45 @@ final class JdPage extends LinearLayout {
       String k = kv.substring(0, eq).trim();
       String v = kv.substring(eq + 1).trim();
       if (k.isEmpty() || v.isEmpty() || "null".equals(v) || "deleted".equals(v)) continue;
-      cm.setCookie("https://www.sf-express.com", k + "=" + v + "; Path=/; Domain=.sf-express.com; Max-Age=2592000; Secure; SameSite=Lax");
-      cm.setCookie("https://www.sf-express.com", k + "=" + v + "; Path=/; Domain=www.sf-express.com; Max-Age=2592000; Secure; SameSite=Lax");
+      cm.setCookie(d, k + "=" + v + "; Path=/; Max-Age=2592000; Secure; SameSite=Lax");
      }
-     cm.flush();
     }
+    cm.flush();
    }
   } catch (Exception ignored) {}
  }
 
- private void restoreSfSessionCookie() {
+ private void restoreDySessionCookie() {
   try {
    SharedPreferences prefs = getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE);
-   String savedCookies = prefs.getString("sf_all_cookies", "");
-   String val = prefs.getString("sf_login_user", "");
+   String saved = prefs.getString("dy_all_cookies", "");
+   if (saved == null || saved.isEmpty()) return;
    CookieManager cm = CookieManager.getInstance();
-   if (savedCookies != null && !savedCookies.isEmpty()) {
-    for (String part : savedCookies.split(";")) {
+   for (String dEntry : saved.split(";;")) {
+    int sep = dEntry.indexOf("::");
+    if (sep <= 0) continue;
+    String d = dEntry.substring(0, sep).trim();
+    String raw = dEntry.substring(sep + 2).trim();
+    for (String part : raw.split(";")) {
      String kv = part.trim();
      int eq = kv.indexOf('=');
      if (eq <= 0) continue;
      String k = kv.substring(0, eq).trim();
      String v = kv.substring(eq + 1).trim();
      if (k.isEmpty() || v.isEmpty() || "null".equals(v) || "deleted".equals(v)) continue;
-     cm.setCookie("https://www.sf-express.com", k + "=" + v + "; Path=/; Domain=.sf-express.com; Max-Age=2592000; Secure; SameSite=Lax");
-     cm.setCookie("https://www.sf-express.com", k + "=" + v + "; Path=/; Domain=www.sf-express.com; Max-Age=2592000; Secure; SameSite=Lax");
+     cm.setCookie(d, k + "=" + v + "; Path=/; Max-Age=2592000; Secure; SameSite=Lax");
     }
-   } else if (val != null && !val.isEmpty()) {
-    cm.setCookie("https://www.sf-express.com", "loginUser=" + val + "; Path=/; Domain=.sf-express.com; Max-Age=2592000; Secure; SameSite=Lax");
-    cm.setCookie("https://www.sf-express.com", "loginUser=" + val + "; Path=/; Domain=www.sf-express.com; Max-Age=2592000; Secure; SameSite=Lax");
    }
    cm.flush();
+  } catch (Exception ignored) {}
+ }
+
+ private void clearDySavedCookies() {
+  try {
+   getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE)
+    .edit()
+    .remove("dy_all_cookies")
+    .apply();
   } catch (Exception ignored) {}
  }
 
@@ -1140,7 +1338,23 @@ final class JdPage extends LinearLayout {
   return b != null && (b.contains("\"st\":0") || b.contains("\"st\": 0")) && !b.contains("10001010A");
  }
 
- private WebResourceResponse interceptDyEcRequest(final WebView v, WebResourceRequest r) {
+ private void invalidateDyApiHistory() {
+  dyNavigationEpoch++;
+  dyApiHistory.clear();
+ }
+
+ private void recordDyApiReply(int epoch, String path, String url, String body) {
+  if (!path.equals("/order/page") && !path.equals("/order/page/") && !path.startsWith("/logistics/")) return;
+  post(() -> {
+   if (destroyed || dyNavigationEpoch != epoch) return;
+   if (dyApiHistory.size() >= 24) dyApiHistory.remove(0);
+   dyApiHistory.add(new String[]{url, body});
+   sampleProvider(PROVIDER_DY);
+  });
+ }
+
+ private WebResourceResponse interceptDyEcRequest(WebResourceRequest r) {
+  int epoch = dyNavigationEpoch;
   String scheme = r.getUrl().getScheme();
   String host = r.getUrl().getHost();
   if (host != null && host.startsWith("10.")) {
@@ -1150,6 +1364,10 @@ final class JdPage extends LinearLayout {
   boolean isEc = "ec.snssdk.com".equalsIgnoreCase(host);
   boolean isHotsoon = "hotsoon.snssdk.com".equalsIgnoreCase(host);
   if (!isEc && !isHotsoon) return null;
+  String path = r.getUrl().getPath();
+  if (path == null || !(isHotsoon ? path.equals("/hotsoon/find/banners")
+      : path.startsWith("/order/") || path.startsWith("/logistics/")
+          || path.equals("/index/getNewAbUiParams"))) return null;
 
   Map<String, String> reqHeaders = r.getRequestHeaders();
   String origin = reqHeaders != null ? reqHeaders.get("Origin") : null;
@@ -1191,6 +1409,7 @@ final class JdPage extends LinearLayout {
      new ByteArrayInputStream(zeroCounts.getBytes(StandardCharsets.UTF_8)));
    }
    String unauth = "{\"code\":\"10001010A\",\"st\":10001,\"msg\":\"请先登录抖音账号\",\"data\":null}";
+   recordDyApiReply(epoch, path, origUrl, unauth);
    return new WebResourceResponse("application/json", "utf-8", 200, "OK", corsHeaders,
     new ByteArrayInputStream(unauth.getBytes(StandardCharsets.UTF_8)));
   }
@@ -1213,11 +1432,8 @@ final class JdPage extends LinearLayout {
    }
    if (!isDyOrderBodyOk(body)) {
     boolean isUnauth = body != null && (body.contains("10001010A") || body.contains("用户未登录"));
-    boolean inGrace = dyLoginSuccessAt > 0 && (android.os.SystemClock.elapsedRealtime() - dyLoginSuccessAt < 15000);
-    if (isUnauth && !inGrace) {
-     body = "{\"code\":\"10001010A\",\"st\":10001,\"msg\":\"抖音登录已过期，可刷新网页重新授权\",\"data\":null}";
-    } else if (isUnauth) {
-     body = "{\"st\":10005,\"code\":\"10005\",\"msg\":\"当前抖音会话暂未授权订单接口，请点击右上角「刷新网页」或重新扫码登录\",\"data\":null}";
+    if (isUnauth) {
+     body = "{\"code\":\"10001010A\",\"st\":10001,\"msg\":\"抖音订单需要重新授权\",\"data\":null}";
     } else {
      body = "{\"st\":10005,\"code\":\"10005\",\"msg\":\"抖音订单同步失败，请点击右上角「刷新网页」重试\",\"data\":null}";
     }
@@ -1249,14 +1465,7 @@ final class JdPage extends LinearLayout {
    }
   }
 
-  if (!body.contains("10001010A") && !body.contains("\"st\":10005")) {
-   if (dyApiHistory.size() >= 24) dyApiHistory.remove(0);
-   dyApiHistory.add(new String[]{origUrl, body});
-  } else if (origUrl.contains("/order/page")) {
-   if (dyApiHistory.size() >= 24) dyApiHistory.remove(0);
-   dyApiHistory.add(new String[]{origUrl, body});
-  }
-  post(() -> sampleProvider(PROVIDER_DY));
+  recordDyApiReply(epoch, path, origUrl, body);
   return new WebResourceResponse("application/json", "utf-8", 200, "OK", corsHeaders,
    new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
  }
@@ -1267,14 +1476,22 @@ final class JdPage extends LinearLayout {
   postDelayed(tick, 900);
  }
 
- private void sampleAll() {
-  for (int p = PROVIDER_JD; p <= PROVIDER_DY; p++) sampleProvider(p);
+ void sampleAll() {
+  for (int p = PROVIDER_JD; p < PROVIDER_COUNT; p++) sampleProvider(p);
+ }
+
+ private void showJdOrderProblem(String message) {
+  if (mode == PROVIDER_JD) status.setText(message);
+  if (message.equals(providerErrors[PROVIDER_JD])) return;
+  providerErrors[PROVIDER_JD] = message;
+  renderSummary(false);
  }
 
  private void sampleProvider(final int provider) {
   final WebView expected = webs[provider];
   final int token = generations[provider];
   if (expected == null || paused || destroyed || inFlight[provider] || !allowedUrl(provider, expected.getUrl())) return;
+  if ((provider == PROVIDER_JD || provider == PROVIDER_SF || provider == PROVIDER_JDL) && !pageCommitted[provider]) return;
   inFlight[provider] = true;
   expected.evaluateJavascript(buildProviderEvalScript(provider), result -> {
    if (destroyed || webs[provider] != expected || generations[provider] != token) return;
@@ -1283,6 +1500,10 @@ final class JdPage extends LinearLayout {
    try {
     JSONObject data = new JSONObject(result);
     if (!samePagePath(data.optString("href"), expected.getUrl())) return;
+    if (provider == PROVIDER_DY && dySmsLoginOffered != data.optBoolean("smsLogin")) {
+     dySmsLoginOffered = data.optBoolean("smsLogin");
+     updateDySmsAction();
+    }
     if (provider == PROVIDER_DY && data.optBoolean("ssoDone")) {
      onDySsoLoginSuccess();
      return;
@@ -1292,69 +1513,62 @@ final class JdPage extends LinearLayout {
      return;
     }
     if (data.optBoolean("login")) {
+     boolean statusChanged = providerSignedIn[provider]
+      || ((provider == PROVIDER_JD || provider == PROVIDER_JDL) && !providerErrors[provider].isEmpty());
      providerErrors[provider] = "";
-     if (provider == PROVIDER_DY) {
-      dyLoginCompleted = false;
-      dyLoginSuccessAt = 0L;
-     }
-     boolean wasSigned = providerSignedIn[provider];
      providerSignedIn[provider] = false;
      providerOrders[provider] = new JSONArray();
-     pendingAutoSummary[provider] = true;
-     if (wasSigned) {
+     if (provider == PROVIDER_JD) lastSnapshots[provider] = "";
+     pendingAutoSummary[provider] = provider != PROVIDER_SF && provider != PROVIDER_JDL;
+     if (statusChanged) {
       saveCachedState();
       notifySessionState();
       renderSummary(false);
      }
      if (mode == provider) {
-      status.setText("请在" + PROVIDER_NAMES[provider] + "官方页面完成登录，登录完后将自动拉取并汇总。");
+      status.setText(loginHint(provider));
+      if (provider == PROVIDER_DY) redirectToDyLoginIfNeeded(expected);
       if (provider == PROVIDER_JD) redirectToJdLoginIfNeeded(expected);
-      else if (provider == PROVIDER_DY) redirectToDyLoginIfNeeded(expected);
       notifySessionState();
      }
      return;
     }
-    if (provider == PROVIDER_JD && data.optBoolean("needFallback")) {
-     providerErrors[PROVIDER_JD] = "";
-     jdPreferMyHome = true;
-     long now = android.os.SystemClock.elapsedRealtime();
-     if (now - lastJdFallback[0] > 6000) {
-      lastJdFallback[0] = now;
-      clearJdRiskCookiesOnly();
-      loadProviderEntry(PROVIDER_JD, expected);
-     }
-     if (mode == PROVIDER_JD) {
-      status.setText("正在通过京东个人中心同步待收货与取件码…");
-     }
+    String jdProblem = provider == PROVIDER_JD ? data.optString("problem") : "";
+    if (!jdProblem.isEmpty()) {
+     showJdOrderProblem("busy".equals(jdProblem) ? "京东订单页当前繁忙，请稍后刷新。"
+      : "京东订单页暂时无法加载，请稍后刷新。");
      return;
     }
     String errMsg = data.optString("error", "");
     if (!errMsg.isEmpty()) {
+     boolean changed = !errMsg.equals(providerErrors[provider]);
      providerErrors[provider] = errMsg;
-     if (provider == PROVIDER_DY && !data.optBoolean("ready") && providerSignedIn[PROVIDER_DY]) {
-      providerSignedIn[PROVIDER_DY] = false;
-      providerOrders[PROVIDER_DY] = new JSONArray();
-      saveCachedState();
-      notifySessionState();
-      renderSummary(false);
-     }
+     if (provider == PROVIDER_JDL && changed) renderSummary(false);
      if (mode == provider) {
       status.setText(errMsg);
      }
      return;
     }
+    boolean ready = data.optBoolean("ready");
+    if (provider == PROVIDER_JD && !ready) return;
+    boolean jdRecovered = (provider == PROVIDER_JD || provider == PROVIDER_JDL) && !providerErrors[provider].isEmpty();
     providerErrors[provider] = "";
-    if (!data.optBoolean("ready")) return;
+    if (!ready && !(provider == PROVIDER_SF && data.optBoolean("authenticated"))) return;
     boolean justLoggedIn = !providerSignedIn[provider] || pendingAutoSummary[provider];
     providerSignedIn[provider] = true;
-    if (provider == PROVIDER_DY) dyLoginCompleted = true;
-    if (provider == PROVIDER_SF) persistSfSessionCookie();
+    if (provider == PROVIDER_DY) {
+     dyOrderNeedsAuthorization = false;
+     persistDySessionCookie();
+    }
+    if (justLoggedIn && (provider == PROVIDER_JD || provider == PROVIDER_SF || provider == PROVIDER_JDL)) {
+     CookieManager.getInstance().flush();
+    }
     JSONArray rows = data.optJSONArray("orders");
-    if (rows != null && (rows.length() > 0 || providerOrders[provider] == null || providerOrders[provider].length() == 0 || data.optBoolean("ready"))) {
+     if (ready && rows != null) {
      providerOrders[provider] = rows;
     }
     String next = data.toString();
-    if (!next.equals(lastSnapshots[provider]) || justLoggedIn) {
+    if (!next.equals(lastSnapshots[provider]) || justLoggedIn || jdRecovered) {
      lastSnapshots[provider] = next;
      saveCachedState();
      notifySessionState();
@@ -1365,24 +1579,201 @@ final class JdPage extends LinearLayout {
      Toast.makeText(getContext(), "已完成" + PROVIDER_NAMES[provider] + "登录，正在汇总取件码", Toast.LENGTH_SHORT).show();
      showSummary();
     } else if (mode == provider) {
-     status.setText("已登录" + PROVIDER_NAMES[provider] + "（已识别 " + countFor(provider) + " 个取件码），可点「‹ 返回汇总」。");
+     status.setText(ready ? signedInStatus(provider) : "顺丰已登录，运单尚未同步。");
     }
    } catch (JSONException ignored) {}
   });
  }
 
+ private static boolean isPickupCode(String code) {
+  return code.matches("[A-Za-z0-9][A-Za-z0-9-]{1,23}");
+ }
+
+ private static boolean validTaobaoOrderKey(String key) {
+  return key.matches("(?:(?:mail|logistics):[A-Za-z0-9_-]{1,80}|trade:[0-9]{1,32}):[0-9]{1,4}")
+   || key.matches("pickup:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}");
+ }
+
+ private static String localTaobaoCodeKey(JSONObject row) {
+  String identity = row.optString("name") + "\n" + row.optString("code");
+  return "pickup:" + UUID.nameUUIDFromBytes(identity.getBytes(StandardCharsets.UTF_8));
+ }
+
+ private static boolean sameTaobaoPickup(JSONObject left, JSONObject right) {
+  if (left == null || right == null || !left.optString("code").equals(right.optString("code"))) return false;
+  String leftName = left.optString("name"), rightName = right.optString("name");
+  return leftName.isEmpty() || rightName.isEmpty() || leftName.equals(rightName);
+ }
+
+ private boolean hasIdentifiedTaobaoCode(JSONObject candidate) {
+  for (Map.Entry<String, JSONArray> entry : taobaoOrderCodes.entrySet()) {
+   if (entry.getKey().startsWith("pickup:")) continue;
+   JSONArray codes = entry.getValue();
+   for (int i = 0; i < codes.length(); i++) {
+    if (sameTaobaoPickup(candidate, codes.optJSONObject(i))) return true;
+   }
+  }
+  return false;
+ }
+
+ private boolean removeLocalTaobaoCodes(JSONArray identifiedCodes) {
+  boolean changed = false;
+  Iterator<Map.Entry<String, JSONArray>> groups = taobaoOrderCodes.entrySet().iterator();
+  while (groups.hasNext()) {
+   Map.Entry<String, JSONArray> entry = groups.next();
+   if (!entry.getKey().startsWith("pickup:")) continue;
+   JSONObject local = entry.getValue().optJSONObject(0);
+   for (int i = 0; i < identifiedCodes.length(); i++) {
+    if (!sameTaobaoPickup(local, identifiedCodes.optJSONObject(i))) continue;
+    groups.remove();
+    changed = true;
+    break;
+   }
+  }
+  return changed;
+ }
+
+ private static JSONArray validTaobaoOrderCodes(JSONArray input) {
+  JSONArray codes = new JSONArray();
+  if (input == null) return codes;
+  for (int i = 0; i < input.length() && i < 12; i++) {
+   JSONObject row = input.optJSONObject(i);
+   if (row == null) continue;
+   String code = row.optString("code");
+   if (!isPickupCode(code)) continue;
+   String station = row.optString("name");
+   try {
+    codes.put(new JSONObject().put("code", code).put("name", station.substring(0, Math.min(60, station.length()))));
+   } catch (JSONException ignored) {}
+  }
+  return codes;
+ }
+
+ boolean syncTaobaoOrderCodes(String orderKey, JSONArray input, boolean pickedUp) {
+  if (!orderKey.isEmpty() && !validTaobaoOrderKey(orderKey)) return false;
+  JSONArray codes = validTaobaoOrderCodes(input);
+  boolean changed = false;
+  if (orderKey.isEmpty()) {
+   if (codes.length() == 0) return false;
+   if (pickedUp) changed = removeLocalTaobaoCodes(codes);
+   else {
+    for (int i = 0; i < codes.length(); i++) {
+     JSONObject row = codes.optJSONObject(i);
+     String localKey = localTaobaoCodeKey(row);
+     if (taobaoOrderCodes.containsKey(localKey) || hasIdentifiedTaobaoCode(row)) continue;
+     taobaoOrderCodes.put(localKey, new JSONArray().put(row));
+     changed = true;
+    }
+   }
+  } else if (pickedUp) {
+   JSONArray previous = taobaoOrderCodes.remove(orderKey);
+   if (previous != null) {
+    removeLocalTaobaoCodes(previous);
+    changed = true;
+   }
+  } else {
+   if (codes.length() == 0) return false;
+   changed = removeLocalTaobaoCodes(codes);
+   JSONArray previous = taobaoOrderCodes.get(orderKey);
+   if (previous == null || !previous.toString().equals(codes.toString())) {
+    taobaoOrderCodes.put(orderKey, codes);
+    changed = true;
+   }
+  }
+  if (!changed) return true;
+  while (taobaoOrderCodes.size() > MAX_TAOBAO_ORDERS) {
+   taobaoOrderCodes.remove(taobaoOrderCodes.keySet().iterator().next());
+  }
+  saveTaobaoOrderCodes();
+  renderSummary(false);
+  return true;
+ }
+
+ void clearTaobaoOrderCodes() {
+  if (taobaoOrderCodes.isEmpty()) return;
+  taobaoOrderCodes.clear();
+  saveTaobaoOrderCodes();
+  renderSummary(false);
+ }
+
+ private void saveTaobaoOrderCodes() {
+  JSONArray saved = new JSONArray();
+  for (Map.Entry<String, JSONArray> entry : taobaoOrderCodes.entrySet()) {
+   try {
+    saved.put(new JSONObject().put("orderKey", entry.getKey()).put("codes", entry.getValue()));
+   } catch (JSONException ignored) {}
+  }
+  getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE).edit()
+   .putString(PREF_TAOBAO_ORDER_CODES, saved.toString()).apply();
+ }
+
+ private List<JSONObject> taobaoPickupRows() {
+  List<JSONObject> rows = new ArrayList<>();
+  Set<String> liveCodesByStation = new HashSet<>();
+  if (providerSignedIn[PROVIDER_TB]) {
+   JSONArray parcels = providerOrders[PROVIDER_TB];
+   for (int i = 0; i < parcels.length(); i++) {
+    JSONObject row = parcels.optJSONObject(i);
+    if (row == null) continue;
+    String code = row.optString("code");
+    if (code.isEmpty()) continue;
+    rows.add(row);
+    liveCodesByStation.add(row.optString("name") + "\n" + code);
+   }
+  }
+  for (JSONArray codes : taobaoOrderCodes.values()) {
+   for (int i = 0; i < codes.length(); i++) {
+    JSONObject row = codes.optJSONObject(i);
+    if (row != null && (row.optString("name").isEmpty()
+        || !liveCodesByStation.contains(row.optString("name") + "\n" + row.optString("code")))) rows.add(row);
+   }
+  }
+  return rows;
+ }
+
+ private void removeTaobaoOrderCode(JSONObject row) {
+  for (Iterator<JSONArray> groups = taobaoOrderCodes.values().iterator(); groups.hasNext();) {
+   JSONArray codes = groups.next();
+   for (int i = 0; i < codes.length(); i++) {
+    if (codes.optJSONObject(i) != row) continue;
+    codes.remove(i);
+    if (codes.length() == 0) groups.remove();
+    saveTaobaoOrderCodes();
+    renderSummary(false);
+    return;
+   }
+  }
+ }
+
+ private void saveManualJdlCodes() {
+  getContext().getSharedPreferences(PREF_CACHE, Context.MODE_PRIVATE).edit()
+   .putString(PREF_MANUAL_JDL_CODES, manualJdlCodes.toString()).apply();
+  renderSummary(false);
+ }
+
+ private void removeManualJdlCode(JSONObject row) {
+  for (int i = 0; i < manualJdlCodes.length(); i++) {
+   if (manualJdlCodes.optJSONObject(i) == row) {
+    manualJdlCodes.remove(i);
+    saveManualJdlCodes();
+    return;
+   }
+  }
+ }
+
  private void updateSummaryStatusText() {
   if (mode != MODE_SUMMARY) return;
   int loggedInCount = 0;
-  int totalCodes = 0;
-  for (int p = 0; p < PROVIDER_COUNT; p++) {
-   if (providerSignedIn[p]) {
+  int totalCodes = manualJdlCodes.length() + countForPlatform(PROVIDER_TB);
+  for (int p : PLATFORMS) {
+   if (isPlatformSignedIn(p)) {
     loggedInCount++;
-    totalCodes += countFor(p);
+    if (p != PROVIDER_TB) totalCodes += countForPlatform(p);
    }
   }
   if (loggedInCount == 0) {
-   status.setText("尚未登录取件平台；请点左上角「切换软件」选择软件登录。");
+   status.setText(totalCodes > 0 ? "本机已添加 " + totalCodes + " 个待取件码。"
+    : "尚未登录取件平台；请点左上角「切换软件」选择软件登录。");
   } else {
    status.setText("已登录 " + loggedInCount + " 个平台，共汇总 " + totalCodes + " 个待取件码。");
   }
@@ -1392,6 +1783,10 @@ final class JdPage extends LinearLayout {
   updateSummaryStatusText();
   StringBuilder sig = new StringBuilder();
   sig.append(dark).append('|');
+  sig.append(manualJdlCodes).append('|');
+  sig.append(taobaoOrderCodes).append('|');
+  sig.append(providerErrors[PROVIDER_JD]).append('|');
+  sig.append(providerErrors[PROVIDER_JDL]).append('|');
   for (int p = 0; p < PROVIDER_COUNT; p++) {
    sig.append(providerSignedIn[p]).append(':').append(providerOrders[p] != null ? providerOrders[p].toString() : "").append('|');
   }
@@ -1401,11 +1796,12 @@ final class JdPage extends LinearLayout {
 
   cards.removeAllViews();
   int loggedInCount = 0;
-  int totalCodes = 0;
-  for (int p = 0; p < PROVIDER_COUNT; p++) {
-   if (providerSignedIn[p]) {
+  List<JSONObject> taobaoRows = taobaoPickupRows();
+  int totalCodes = manualJdlCodes.length() + taobaoRows.size();
+  for (int p : PLATFORMS) {
+   if (isPlatformSignedIn(p)) {
     loggedInCount++;
-    totalCodes += countFor(p);
+    if (p != PROVIDER_TB) totalCodes += countForPlatform(p);
    }
   }
 
@@ -1417,11 +1813,11 @@ final class JdPage extends LinearLayout {
 
   LinearLayout headRow = new LinearLayout(getContext());
   headRow.setGravity(Gravity.CENTER_VERTICAL);
-  TextView headTitle = text("各软件登录与同步状态", 15);
+  TextView headTitle = text("登录与查件", 15);
   headTitle.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
   headTitle.setTextColor(AppTheme.ink(dark));
   headRow.addView(headTitle, new LinearLayout.LayoutParams(0, -2, 1f));
-  TextView headHint = text("点击软件可登录/查看", 12);
+  TextView headHint = text("登录后点平台查件", 12);
   headHint.setTextColor(AppTheme.muted(dark));
   headRow.addView(headHint);
   statusCard.addView(headRow);
@@ -1434,26 +1830,24 @@ final class JdPage extends LinearLayout {
   LinearLayout row2 = new LinearLayout(getContext());
   row2.setOrientation(HORIZONTAL);
   row2.setPadding(0, dp(8), 0, 0);
-  for (int p = 0; p < PROVIDER_COUNT; p++) {
+  for (int p : PLATFORMS) {
    final int provider = p;
-   boolean signed = providerSignedIn[p];
-   int cnt = countFor(p);
-   TextView chip = text((signed ? "● " : "○ ") + PROVIDER_NAMES[p] + (signed ? " (" + cnt + ")" : " 去登录"), 12);
+   boolean signed = isPlatformSignedIn(p);
+   int codeCount = countForPlatform(p);
+   String chipText = (signed ? "● " : "○ ") + PROVIDER_NAMES[p] + (signed || codeCount > 0 ? " (" + codeCount + ")" : " 去登录");
+   TextView chip = text(chipText, 12);
    chip.setGravity(Gravity.CENTER);
    chip.setSingleLine(true);
    chip.setTypeface(Typeface.DEFAULT, signed ? Typeface.BOLD : Typeface.NORMAL);
+   chip.setEllipsize(android.text.TextUtils.TruncateAt.END);
    chip.setTextColor(signed ? AppTheme.accentText(dark) : AppTheme.muted(dark));
    chip.setPadding(dp(8), dp(8), dp(8), dp(8));
    chip.setBackground(roundBg(AppTheme.subtleFill(dark), 12));
-   chip.setOnClickListener(v -> openProvider(provider));
+   chip.setOnClickListener(v -> externalSwitch.accept(provider));
    LinearLayout.LayoutParams clp = new LinearLayout.LayoutParams(0, -2, 1f);
-   if (p < 3) {
-    if (p < 2) clp.setMarginEnd(dp(8));
-    row1.addView(chip, clp);
-   } else {
-    if (p == 3) clp.setMarginEnd(dp(8));
-    row2.addView(chip, clp);
-   }
+   boolean topRow = p == PROVIDER_TB || p == PROVIDER_PDD;
+   if (p != PROVIDER_PDD && p != PROVIDER_DY) clp.setMarginEnd(dp(8));
+   (topRow ? row1 : row2).addView(chip, clp);
   }
   grid.addView(row1, new LinearLayout.LayoutParams(-1, -2));
   grid.addView(row2, new LinearLayout.LayoutParams(-1, -2));
@@ -1463,26 +1857,34 @@ final class JdPage extends LinearLayout {
   cardLp.bottomMargin = dp(12);
   cards.addView(statusCard, cardLp);
 
-  // Render aggregated pickup code cards across all 5 platforms
-  for (int p = 0; p < PROVIDER_COUNT; p++) {
-   if (!providerSignedIn[p] || providerOrders[p] == null) continue;
-   JSONArray rows = providerOrders[p];
-   for (int i = 0; i < rows.length(); i++) {
-    JSONObject o = rows.optJSONObject(i);
-    if (o == null) continue;
-    String codeVal = o.optString("code", "").trim();
-    if (codeVal.isEmpty()) continue;
-    addPickupCard(p, o.optString("name", PROVIDER_NAMES[p] + "包裹"), codeVal,
-     o.optString("status", "待取件"), o.optString("detail", ""));
-   }
-  }
+  appendManualJdlCodes(cards);
 
-  if (totalCodes == 0) {
+  // JD Mall and JD Express cards are appended after the other platforms.
+  for (int p = 0; p < PROVIDER_COUNT; p++) {
+   if (p == LEGACY_CN_SLOT || p == PROVIDER_JD || p == PROVIDER_JDL) continue;
+   if (p == PROVIDER_TB) {
+    for (JSONObject row : taobaoRows) {
+     boolean fromOrder = !row.has("id");
+     String name = row.optString("name");
+     if (name.isEmpty()) name = fromOrder ? "淘宝订单包裹" : "淘宝/菜鸟包裹";
+     addPickupCard(p, name, row.optString("code"), row.optString("status", "待取件"),
+      fromOrder ? "来自淘宝订单物流" : row.optString("detail"), fromOrder ? () -> removeTaobaoOrderCode(row) : null);
+    }
+    continue;
+   }
+   appendProviderPickupCards(cards, p);
+  }
+  boolean jdOrdersDisplayed = appendJdMallOrders(cards);
+  appendProviderPickupCards(cards, PROVIDER_JDL);
+  String jdExpressProblem = providerErrors[PROVIDER_JDL];
+  if (!jdExpressProblem.isEmpty()) addInfoCard(cards, "京东快递暂未更新", jdExpressProblem);
+
+  if (totalCodes == 0 && !jdOrdersDisplayed && jdExpressProblem.isEmpty()) {
    addInfoCard(
     loggedInCount == 0 ? "暂未登录任何软件" : "暂无待取件码",
     loggedInCount == 0
-     ? "点击左上角「切换软件」或上方软件标签，即可登录淘宝、拼多多、京东、顺丰或抖音。登录完成后会自动拉取取件码并汇总在此处。"
-     : "当前已登录的软件中没有待取包裹或订单未返回取件码。可下拉页面或点击右上角「刷新全部」重新拉取，也可点击左上角切换其他软件登录。"
+     ? "可点击左上角「切换/汇总」或上方标签，登录淘宝 / 菜鸟、拼多多、京东、顺丰或抖音。登录后会自动提取取件码并汇总在此处。"
+     : "当前已登录的软件中没有待取包裹或订单未返回取件码。可下拉页面或点击右上角「刷新全部」重新拉取，也可点击上方或左上角切换其他软件登录。"
    );
   }
 
@@ -1493,7 +1895,83 @@ final class JdPage extends LinearLayout {
   cards.addView(pullFooter, new LinearLayout.LayoutParams(-1, -2));
  }
 
- private void addPickupCard(int provider, String title, String pickupCode, String statusText, String detailText) {
+ private void appendManualJdlCodes(LinearLayout target) {
+  for (int i = 0; i < manualJdlCodes.length(); i++) {
+   JSONObject row = manualJdlCodes.optJSONObject(i);
+   if (row == null) continue;
+   addPickupCard(target, PROVIDER_JDL, "手动录入", row.optString("code"), "待取件", row.optString("note"),
+    "已取件", () -> removeManualJdlCode(row));
+  }
+ }
+
+ private void appendProviderPickupCards(LinearLayout target, int provider) {
+  JSONArray orders = providerOrders[provider];
+  if (!providerSignedIn[provider] || orders == null) return;
+  for (int i = 0; i < orders.length(); i++) {
+   JSONObject order = orders.optJSONObject(i);
+   if (order == null) continue;
+   String code = order.optString("code").trim();
+   if (code.isEmpty()) continue;
+   addPickupCard(target, provider, order.optString("name", PROVIDER_NAMES[provider] + "包裹"), code,
+    order.optString("status", "待取件"), order.optString("detail", ""), "", null);
+  }
+ }
+
+ private boolean appendJdMallOrders(LinearLayout target) {
+  boolean displayed = false;
+  String problem = providerErrors[PROVIDER_JD];
+  if (!problem.isEmpty()) {
+   addInfoCard(target, "京东取件信息暂未更新", problem);
+   displayed = true;
+  }
+  JSONArray orders = providerOrders[PROVIDER_JD];
+  if (!providerSignedIn[PROVIDER_JD] || orders == null) return displayed;
+  for (int i = 0; i < orders.length(); i++) {
+   JSONObject order = orders.optJSONObject(i);
+   if (order == null) continue;
+   String code = order.optString("code").trim();
+   if (code.isEmpty() && !order.optBoolean("arrived")) continue;
+   String station = order.optString("station");
+   String name = station.isEmpty() ? order.optString("name", "京东订单") : station;
+   String detail = order.optString("detail");
+   String orderId = order.optString("id");
+   String orderLink = order.optString("link");
+   boolean canOpenLogistics = orderId.matches("[0-9]{1,32}") || JdUrlPolicy.allowedMall(orderLink);
+   if (code.isEmpty()) {
+    detail = (detail.isEmpty() ? "" : detail + "\n") + "京东网页未提供取件码";
+   }
+   addPickupCard(target, PROVIDER_JD, name, code, code.isEmpty() ? "已到站" : "待取件", detail,
+    "在京东 App 查看物流", canOpenLogistics ? () -> openJdAppLogistics(orderId, orderLink) : null);
+   displayed = true;
+  }
+  return displayed;
+ }
+
+ private void openJdAppLogistics(String orderId, String orderLink) {
+  try {
+   JSONObject params = new JSONObject().put("category", "jump");
+   if (orderId.matches("[0-9]{1,32}")) {
+    params.put("des", "orderTrack").put("orderId", orderId);
+   } else if (JdUrlPolicy.allowedMall(orderLink)) {
+    params.put("des", "m").put("url", orderLink);
+   } else return;
+   android.net.Uri target = android.net.Uri.parse("openapp.jdmobile://virtual").buildUpon()
+    .appendQueryParameter("params", params.toString()).build();
+   android.content.Intent intent = new android.content.Intent(android.content.Intent.ACTION_VIEW, target)
+    .addCategory(android.content.Intent.CATEGORY_BROWSABLE).setPackage("com.jingdong.app.mall");
+   getContext().startActivity(intent);
+  } catch (android.content.ActivityNotFoundException | SecurityException unavailable) {
+   Toast.makeText(getContext(), "无法打开京东物流页，请确认已安装京东 App。", Toast.LENGTH_SHORT).show();
+  } catch (JSONException ignored) {}
+ }
+
+ private void addPickupCard(int provider, String title, String pickupCode, String statusText, String detailText,
+                            Runnable markPickedUp) {
+  addPickupCard(cards, provider, title, pickupCode, statusText, detailText, "已取件", markPickedUp);
+ }
+
+ private void addPickupCard(LinearLayout target, int provider, String title, String pickupCode, String statusText, String detailText,
+                            String actionLabel, Runnable onAction) {
   LinearLayout card = new LinearLayout(getContext());
   card.setOrientation(VERTICAL);
   card.setPadding(dp(16), dp(14), dp(16), dp(14));
@@ -1524,12 +2002,14 @@ final class JdPage extends LinearLayout {
   }
   card.addView(topRow);
 
-  TextView codeView = text("取件码：" + pickupCode, 20);
-  codeView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-  codeView.setTextColor(AppTheme.accentText(dark));
-  codeView.setPadding(0, dp(10), 0, dp(4));
-  codeView.setTextIsSelectable(true);
-  card.addView(codeView);
+  if (!pickupCode.isEmpty()) {
+   TextView codeView = text("取件码：" + pickupCode, 20);
+   codeView.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+   codeView.setTextColor(AppTheme.accentText(dark));
+   codeView.setPadding(0, dp(10), 0, dp(4));
+   codeView.setTextIsSelectable(true);
+   card.addView(codeView);
+  }
 
   if (!detailText.isEmpty()) {
    TextView detail = text(detailText, 13);
@@ -1539,12 +2019,26 @@ final class JdPage extends LinearLayout {
    card.addView(detail);
   }
 
+  if (onAction != null) {
+   Button done = action(actionLabel, onAction);
+   done.setBackground(roundBg(AppTheme.subtleFill(dark), 10));
+   done.setTextColor(AppTheme.accentText(dark));
+   LinearLayout.LayoutParams doneLp = new LinearLayout.LayoutParams(-2, dp(40));
+   doneLp.gravity = Gravity.END;
+   doneLp.topMargin = dp(6);
+   card.addView(done, doneLp);
+  }
+
   LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
   lp.bottomMargin = dp(12);
-  cards.addView(card, lp);
+  target.addView(card, lp);
  }
 
  private void addInfoCard(String title, String body) {
+  addInfoCard(cards, title, body);
+ }
+
+ private void addInfoCard(LinearLayout target, String title, String body) {
   LinearLayout card = new LinearLayout(getContext());
   card.setOrientation(VERTICAL);
   card.setPadding(dp(16), dp(16), dp(16), dp(16));
@@ -1559,66 +2053,90 @@ final class JdPage extends LinearLayout {
   card.addView(detail);
   LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
   lp.bottomMargin = dp(12);
-  cards.addView(card, lp);
+  target.addView(card, lp);
  }
 
  void reloadActiveOrAll() {
-  showPage();
-  if (mode >= PROVIDER_JD && mode <= PROVIDER_DY) {
+  if (mode >= PROVIDER_JD && mode < PROVIDER_COUNT) {
+   showPage();
    reloadProvider(mode);
   } else {
-   for (int p = PROVIDER_JD; p <= PROVIDER_DY; p++) reloadProvider(p);
+   showSummary();
+   for (int p = PROVIDER_JD; p < PROVIDER_COUNT; p++) reloadProvider(p);
    externalSwitch.accept(-2); // Signal MainActivity to also refresh TB & PDD parcels
-   Toast.makeText(getContext(), "正在刷新全部已登录平台的取件码…", Toast.LENGTH_SHORT).show();
+   Toast.makeText(getContext(), "\u6b63\u5237\u65b0\u5168\u90e8\u5df2\u767b\u5f55\u5e73\u53f0\u7684\u53d6\u4ef6\u7801\u2026", Toast.LENGTH_SHORT).show();
   }
  }
 
  void reloadProvider(int provider) {
-  if (provider < PROVIDER_JD || provider > PROVIDER_DY) return;
-  if (provider == PROVIDER_DY) dyApiHistory.clear();
+  if (!isWebProvider(provider)) return;
+  if (provider == PROVIDER_DY) invalidateDyApiHistory();
+  if (provider == PROVIDER_JD) jdLoginRedirected = false;
   generations[provider]++;
   inFlight[provider] = false;
   lastSnapshots[provider] = "";
   providerErrors[provider] = "";
-  if (webs[provider] != null) loadProviderEntry(provider, webs[provider]);
+  WebView web = webs[provider];
+  if (web == null) return;
+  if (provider == PROVIDER_DY && mode == PROVIDER_DY && dyOrderNeedsAuthorization) {
+   dyOrderNeedsAuthorization = false;
+   dyLoginSuccessAt = 0L;
+   loadDyUrl(web, JdUrlPolicy.DY_LOGIN);
+  } else {
+   loadProviderEntry(provider, web);
+  }
+ }
+
+ void refreshJdOrdersAfterIdentityLogin() {
+  if (destroyed || paused) return;
+  if (webs[PROVIDER_JD] == null) ensureWeb(PROVIDER_JD);
+  else if (!providerSignedIn[PROVIDER_JD] || JdUrlPolicy.isMallLoginPage(webs[PROVIDER_JD].getUrl())) {
+   reloadProvider(PROVIDER_JD);
+  }
  }
 
  void resetProviderSession(int provider) {
-  if (provider < PROVIDER_JD || provider > PROVIDER_DY) return;
+  if (!isWebProvider(provider)) return;
+  disposeProviderWebView(provider);
   if (provider == PROVIDER_JD) {
-   jdPreferMyHome = false;
-   lastJdFallback[0] = 0L;
+   jdLoginRedirected = false;
   } else if (provider == PROVIDER_SF) {
    clearStaleSfCookies();
   } else if (provider == PROVIDER_DY) {
-   dyApiHistory.clear();
-   dyLoginCompleted = false;
+   invalidateDyApiHistory();
    dyLoginSuccessAt = 0L;
+   dyOrderNeedsAuthorization = false;
    clearLegacyDyFakeCookie();
    clearAllDySessionCookies();
+   clearDySavedCookies();
   }
-  generations[provider]++;
-  inFlight[provider] = false;
   lastSnapshots[provider] = "";
   providerErrors[provider] = "";
   providerSignedIn[provider] = false;
   pendingAutoSummary[provider] = false;
   providerOrders[provider] = new JSONArray();
   saveCachedState();
-  if (webs[provider] != null) {
-   webs[provider].stopLoading();
-   webs[provider].setWebViewClient(new WebViewClient());
-   webContainer.removeView(webs[provider]);
-   webs[provider].destroy();
-   webs[provider] = null;
-  }
   notifySessionState();
   renderSummary(true);
  }
 
+ private void disposeProviderWebView(int provider) {
+  generations[provider]++;
+  inFlight[provider] = false;
+  pageCommitted[provider] = false;
+  WebView web = webs[provider];
+  if (web == null) return;
+  webs[provider] = null;
+  web.setWebViewClient(new WebViewClient());
+  web.setWebChromeClient(null);
+  web.stopLoading();
+  webContainer.removeView(web);
+  web.destroy();
+ }
+
  void resetSessionView() {
   pausePage();
-  for (int p = PROVIDER_JD; p <= PROVIDER_DY; p++) resetProviderSession(p);
+  for (int p = PROVIDER_JD; p < PROVIDER_COUNT; p++) resetProviderSession(p);
   mode = MODE_SUMMARY;
   updateModeUi();
   renderSummary(true);
@@ -1633,14 +2151,14 @@ final class JdPage extends LinearLayout {
  void pausePage() {
   paused = true;
   idlePage();
-  for (int p = PROVIDER_JD; p <= PROVIDER_DY; p++) {
+  for (int p = PROVIDER_JD; p < PROVIDER_COUNT; p++) {
    if (webs[p] != null) webs[p].onPause();
   }
  }
 
  void resumePage(boolean active) {
   paused = false;
-  for (int p = PROVIDER_JD; p <= PROVIDER_DY; p++) {
+  for (int p = PROVIDER_JD; p < PROVIDER_COUNT; p++) {
    if (webs[p] != null) webs[p].onResume();
   }
   if (active) showPage();
@@ -1648,13 +2166,13 @@ final class JdPage extends LinearLayout {
  }
 
  void scrollFocusedInput() {
-  if (mode >= PROVIDER_JD && mode <= PROVIDER_DY && webs[mode] != null) {
+  if (mode >= PROVIDER_JD && mode < PROVIDER_COUNT && webs[mode] != null) {
    webs[mode].evaluateJavascript("(function(){var e=document.activeElement;if(e&&e.matches('input,textarea'))e.scrollIntoView({block:'center'});})()", null);
   }
  }
 
  boolean goBack() {
-  if (mode >= PROVIDER_JD && mode <= PROVIDER_DY) {
+  if (mode >= PROVIDER_JD && mode < PROVIDER_COUNT) {
    WebView w = webs[mode];
    if (w != null && w.canGoBack()) {
     w.goBack();
@@ -1667,7 +2185,15 @@ final class JdPage extends LinearLayout {
  }
 
  void destroyPage() {
-  resetSessionView();
+  if (destroyed) return;
   destroyed = true;
+  pausePage();
+  invalidateDyApiHistory();
+  for (int p = PROVIDER_JD; p < PROVIDER_COUNT; p++) disposeProviderWebView(p);
+  CookieManager.getInstance().flush();
+ }
+
+ void notifyTaobaoLoginChanged(boolean tbLoggedIn) {
+  updateExternalParcels(PROVIDER_TB, tbLoggedIn, null);
  }
 }

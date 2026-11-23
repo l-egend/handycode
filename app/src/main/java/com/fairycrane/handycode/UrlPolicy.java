@@ -10,15 +10,21 @@ public final class UrlPolicy {
     public static final String TAOBAO_ENTRY =
         "https://pages-fast.m.taobao.com/wow/z/uniapp/1011717/last-mile-fe/end-collect-platform/identity-code";
     public static final String TAOBAO_PARCELS_ENTRY =
-        "https://pages-fast.m.taobao.com/wow/z/uniapp/1100333/last-mile-fe/m-end-school-tab/home";
+        "https://pages-fast.m.taobao.com/wow/z/uniapp/1011717/last-mile-fe/end-collect-platform/school-search";
+    public static final String TAOBAO_ORDERS_ENTRY = "https://h5.m.taobao.com/mlapp/olist.html?tabCode=waitConfirm";
     private static final String[] ALLOWED_HOSTS = {"taobao.com", "tmall.com", "alipay.com", "cainiao.com", "alibaba.com"};
+    private static final String[] TAOBAO_ORDER_HOSTS = {"taobao.com", "tmall.com", "cainiao.com"};
     private UrlPolicy() {}
 
     public static boolean isAllowed(String raw) {
+        return belongsTo(raw, ALLOWED_HOSTS);
+    }
+
+    private static boolean belongsTo(String raw, String[] domains) {
         URI uri = httpsUri(raw);
         if (uri == null) return false;
         String host = uri.getHost().toLowerCase(Locale.ROOT);
-        for (String root : ALLOWED_HOSTS) {
+        for (String root : domains) {
             if (host.equals(root) || host.endsWith("." + root)) return true;
         }
         return false;
@@ -27,6 +33,27 @@ public final class UrlPolicy {
     public static boolean isPddAllowed(String raw) {
         URI uri = httpsUri(raw);
         return uri != null && "m.pinduoduo.net".equalsIgnoreCase(uri.getHost());
+    }
+
+    public static boolean isTaobaoOrderSite(String raw) {
+        return belongsTo(raw, TAOBAO_ORDER_HOSTS);
+    }
+
+    public static boolean sameTaobaoOrderPage(String current, String sampled) {
+        URI currentUri = httpsUri(current);
+        return currentUri != null && currentUri.equals(httpsUri(sampled));
+    }
+
+    public static boolean isTaobaoPhonePage(String raw) {
+        URI uri = httpsUri(raw);
+        return uri != null && "pages-fast.m.taobao.com".equalsIgnoreCase(uri.getHost()) && uri.getPath() != null
+            && uri.getPath().matches("/wow/z/uniapp/1011717/last-mile-fe/end-collect-platform/phone-manage(?:-ssr|-xy-ssr)?");
+    }
+
+    public static boolean isTaobaoAddPhonePage(String raw) {
+        URI uri = httpsUri(raw);
+        return uri != null && "pages-fast.m.taobao.com".equalsIgnoreCase(uri.getHost()) && uri.getPath() != null
+            && uri.getPath().matches("/wow/z/uniapp/1011717/last-mile-fe/end-collect-platform/add-friend-phone(?:-ssr)?");
     }
 
     public static boolean isPddLoginPage(String raw) {
@@ -47,7 +74,7 @@ public final class UrlPolicy {
         URI uri = httpsUri(raw);
         if (uri == null || !"pfile.pddpic.com".equalsIgnoreCase(uri.getHost()) || uri.getPath() == null) return null;
         if (uri.getPath().matches("/mdkd/mdkd/_next/static/chunks/1235-[0-9a-f]+\\.js")) return "identity";
-        if (uri.getPath().matches("/mdkd/mdkd/_next/static/chunks/8905-[0-9a-f]+\\.js")) return "parcels";
+        if (uri.getPath().matches("/mdkd/mdkd/_next/static/chunks/(?:8905|5709)-[0-9a-f]+\\.js")) return "parcels";
         return null;
     }
 

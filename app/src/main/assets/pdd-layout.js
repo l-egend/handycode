@@ -2,6 +2,10 @@
  'use strict';
  if (window.top !== window || location.origin !== 'https://m.pinduoduo.net' || location.pathname !== '/mdkd/package') return;
  if (window.HandyPddLayout) return;
+ var parcelsOnly = window.__HC_PDD_PARCELS_ONLY__ === true;
+ var visiblePart = parcelsOnly ? 'parcels' : 'identity';
+ var addLabels = /^(?:添加(?:快递(?:单号|运单号)?|包裹|单号|运单号)|录入(?:快递单号|运单号|单号))$/;
+ var addControls = 'button,a,[role="button"],.code-link,.add-package';
  var source, shell, backBar, sourceMode = false, queued = false, touching = false, lastTouch = 0;
  var refreshes = {}, failedRefresh = {};
  var reveals = new Set();
@@ -117,6 +121,8 @@
   if (--budget.count < 0) throw new Error('projection-too-large');
   if (node.nodeType === 3) return document.createTextNode(node.nodeValue);
   if (node.nodeType !== 1 || /^(SCRIPT|STYLE|LINK|IFRAME|FORM|INPUT|TEXTAREA|SELECT|OBJECT|EMBED|NOSCRIPT)$/.test(node.tagName)) return null;
+  // The parcel dialog opens the official add page from its toolbar.
+  if (budget.parcels && node.matches(addControls) && isParcelAddLabel(node)) return null;
   var computed = getComputedStyle(node);
   if (computed.display === 'none' || computed.visibility === 'hidden') return null;
   var copy = node.cloneNode(false);
@@ -140,6 +146,12 @@
    css(result, {position:'static',transform:'none',width:'100%',height:'auto','min-height':'0',margin:'0',padding:'0','text-align':'center'});
   }
   return result;
+ }
+ function changePhoneControl(root) {
+  if (!root) return null;
+  var node = root.querySelector('button,a,[role="button"],span,div');
+  if (node && /修改|更换|管理|添加/.test(node.textContent || '')) return node;
+  return root;
  }
  function identityRoot() { return source.querySelector('[class*="identification-code-container"]'); }
  function pendingRoots() {
@@ -172,8 +184,13 @@
   if (signatures.identity === signature && mount.dataset.ready) return true;
   var content = document.createElement('div');
   content.className = 'hc-pdd-code';
-  var phone = copyPart(root.querySelector('.identification-code-mobile-info'), 'hc-pdd-phone');
-  if (phone) content.appendChild(phone);
+  var phoneRoot = root.querySelector('.identification-code-mobile-info');
+  var change = changePhoneControl(phoneRoot);
+  var phone = copyPart(phoneRoot, 'hc-pdd-phone');
+  if (phone) {
+   if (change) links.set(phone, change);
+   content.appendChild(phone);
+  }
   var image = root.querySelector('.identification-code-img');
   if (image) {
    var barcode = document.createElement('img');
@@ -210,7 +227,7 @@
   if (signatures.parcels === signature && mount.dataset.ready) return true;
   var content = document.createElement('div');
   roots.forEach(function (node) {
-   var copy = clone(node, {count:6000});
+   var copy = clone(node, {count:6000, parcels:true});
    if (!copy) return;
    css(copy, {position:'static',transform:'none',width:'100%',height:'auto','min-height':'0','max-height':'none',margin:'0'});
    content.appendChild(copy);
@@ -232,28 +249,36 @@
   if (location.pathname !== '/mdkd/package') { workflow(true); return; }
   if (touching || Date.now() - lastTouch < 800) { queue(); return; }
   try {
-   var identity = updateIdentity(), parcels = updatePending();
-   if (!authenticated && (identity || parcels)) {
+   var ready = parcelsOnly ? updatePending() : updateIdentity();
+   var hasHiddenParcels = !parcelsOnly && pendingRoots().some(function (node) { return node.textContent.trim(); });
+   if (!authenticated && (ready || hasHiddenParcels)) {
     authenticated = true;
     console.info('__HANDYCODE_PDD_AUTH__:signed-in');
    }
-   if (identity && !parcels && !triedPackage && Date.now() - started > 1500) {
+   // The identity tab can still supply the summary with data from the hidden official list.
+   var needsParcels = parcelsOnly ? !ready : ready && !hasHiddenParcels;
+   if (needsParcels && !triedPackage && Date.now() - started > 1500) {
     var tab = sourceTab('取快递');
     if (tab) {
      triedPackage = true; tab.click();
-     setTimeout(function () { var id = sourceTab('身份码'); if (id) id.click(); queue(); }, 250);
+     if (!parcelsOnly) setTimeout(function () {
+      if (sourceMode || location.pathname !== '/mdkd/package') return;
+      var id = sourceTab('身份码');
+      if (id) id.click();
+      queue();
+     }, 250);
     }
    }
-   if (identity && parcels) phase('cards');
-   if (Date.now() - started > 15000) ['identity','parcels'].forEach(function (type) {
-    var mount = document.getElementById('hc-pdd-' + type);
-    if (!mount.dataset.ready && !refreshes[type] && !failedRefresh[type] && !mount.querySelector('.hc-pdd-recover')) {
+   if (ready) phase('cards');
+   if (Date.now() - started > 15000) {
+    var mount = document.getElementById('hc-pdd-' + visiblePart);
+    if (!mount.dataset.ready && !refreshes[visiblePart] && !failedRefresh[visiblePart] && !mount.querySelector('.hc-pdd-recover')) {
      mount.innerHTML = '<p class="hc-pdd-wait">官方内容暂未就绪，请刷新或完成官方页面提示。</p>';
      var recover = document.createElement('button'); recover.className = 'hc-pdd-recover';
      recover.textContent = '打开官方页面'; recover.addEventListener('click', function () { workflow(true); });
      mount.appendChild(recover);
     }
-   });
+   }
   } catch (error) { phase('unavailable'); }
  }
  function queue() {
@@ -307,13 +332,25 @@
  }
  function back() {
   if (!sourceMode) return false;
+  console.info('__HANDYCODE_PDD_BACK_TO_PICKUP__');
   if (location.pathname !== '/mdkd/package') { history.back(); return true; }
   workflow(false); return true;
+ }
+ function isParcelAddLabel(node) {
+  return addLabels.test((node.textContent || '').replace(/[\s+＋]/g, ''));
  }
  function clicked(event) {
   var node = event.target, original;
   while (node && node !== shell && !(original = links.get(node))) node = node.parentNode;
-  if (!original || !original.isConnected) return;
+  if (!original || !original.isConnected) {
+   if (event.target.closest && event.target.closest('.hc-pdd-phone-manage')) {
+    event.preventDefault();
+    workflow(true);
+    location.href = 'https://m.pinduoduo.net/mdkd/cellPhoneList';
+    return;
+   }
+   return;
+  }
   event.preventDefault();
   if (!original.closest('.identification-code-tips')) workflow(true);
   original.click(); queue();
@@ -332,6 +369,7 @@
   }
   if (bootObserver) { bootObserver.disconnect(); clearTimeout(bootTimeout); }
   source.setAttribute('data-hc-pdd-source', '');
+  document.documentElement.classList.toggle('hc-pdd-parcels-only', parcelsOnly);
   var style = document.createElement('style');
   style.textContent = `
 html{height:auto!important;min-height:100vh!important;background:#f5f6f8!important;overflow-x:hidden!important;overflow-y:auto!important}
@@ -343,7 +381,7 @@ html:not(.hc-pdd-source-mode) body>:not(#hc-pdd-shell):not(#hc-pdd-back):not([da
 .hc-pdd-card{margin-bottom:14px;border:1px solid #e9ecf0;border-radius:16px;background:#fff;overflow:visible;transition:background-color .2s,border-color .2s}
 .hc-pdd-heading{display:flex;align-items:center;justify-content:space-between;padding:12px 14px;border-bottom:1px solid #f0f2f5}
 .hc-pdd-heading h2{margin:0;font-size:16px;font-weight:650}
-.hc-pdd-heading button{border:0;background:none;color:#d4542d;padding:5px 0;font:12px system-ui,sans-serif}
+.hc-pdd-heading button,.hc-pdd-heading a{border:0;background:none;color:#d4542d;padding:5px 0;font:12px system-ui,sans-serif;text-decoration:none}
 .hc-pdd-content{padding:16px 10px;min-width:0;overflow:visible}
 #hc-pdd-identity{min-height:310px}
 #hc-pdd-parcels{min-height:140px}
@@ -365,12 +403,14 @@ html:not(.hc-pdd-source-mode) body>:not(#hc-pdd-shell):not(#hc-pdd-back):not([da
 @media(prefers-reduced-motion:reduce){.hc-pdd-placeholder i::after{animation:none}}
 .hc-pdd-wait{padding:20px 8px;color:#89919d;text-align:center;font-size:12px}
 #hc-pdd-back{position:fixed;left:0;right:0;top:0;height:44px;z-index:2147483647;background:#fff;border-bottom:1px solid #e9ecf0;display:flex;align-items:center;padding:0 14px}
-#hc-pdd-back button{background:none;border:0;color:#d4542d;font:14px system-ui,sans-serif}
+#hc-pdd-back button{background:none;border:0;color:#d4542d;font:14px system-ui,sans-serif;flex-shrink:0}
+html.hc-pdd-parcels-only [data-hc-pdd-source] [class*="identification-code-container"]{display:none!important}
+ html.hc-pdd-source-mode:not(.hc-pdd-parcels-only) [data-hc-pdd-source] :is([class*="package-list-wrapper"],[class*="package-none-container"],.rm-tab-bar){display:none!important}
 html[data-hc-theme="dark"],html[data-hc-theme="dark"] body,html[data-hc-theme="dark"] #hc-pdd-shell,html[data-hc-theme="dark"].hc-pdd-source-mode [data-hc-pdd-source],html[data-hc-theme="dark"].hc-pdd-source-mode [data-hc-pdd-source] [class*="container"]{background:#0f1218!important;background-color:#0f1218!important;color-scheme:dark}
 html[data-hc-theme="dark"] #hc-pdd-shell{color:#e6eaf2}
 html[data-hc-theme="dark"] .hc-pdd-card{background:#181c24;border-color:#262c36}
 html[data-hc-theme="dark"] .hc-pdd-heading{border-bottom-color:#232833;color:#e6eaf2}
-html[data-hc-theme="dark"] .hc-pdd-heading button,html[data-hc-theme="dark"] #hc-pdd-back button{color:#ff855e}
+html[data-hc-theme="dark"] .hc-pdd-heading button,html[data-hc-theme="dark"] .hc-pdd-heading a,html[data-hc-theme="dark"] #hc-pdd-back button{color:#ff855e}
 html[data-hc-theme="dark"] .hc-pdd-barcode,html[data-hc-theme="dark"] .hc-pdd-qr{background:#fff!important;padding:8px 10px!important;border-radius:10px!important}
 html[data-hc-theme="dark"] .hc-pdd-placeholder i{background:#232936}
 html[data-hc-theme="dark"] .hc-pdd-placeholder i::after{background:linear-gradient(90deg,transparent,rgba(255,255,255,.15),transparent)}
@@ -381,24 +421,30 @@ html:not([data-hc-theme="light"]),html:not([data-hc-theme="light"]) body,html:no
 html:not([data-hc-theme="light"]) #hc-pdd-shell{color:#e6eaf2}
 html:not([data-hc-theme="light"]) .hc-pdd-card{background:#181c24;border-color:#262c36}
 html:not([data-hc-theme="light"]) .hc-pdd-heading{border-bottom-color:#232833;color:#e6eaf2}
-html:not([data-hc-theme="light"]) .hc-pdd-heading button,html:not([data-hc-theme="light"]) #hc-pdd-back button{color:#ff855e}
+html:not([data-hc-theme="light"]) .hc-pdd-heading button,html:not([data-hc-theme="light"]) .hc-pdd-heading a,html:not([data-hc-theme="light"]) #hc-pdd-back button{color:#ff855e}
 html:not([data-hc-theme="light"]) .hc-pdd-barcode,html:not([data-hc-theme="light"]) .hc-pdd-qr{background:#fff!important;padding:8px 10px!important;border-radius:10px!important}
 html:not([data-hc-theme="light"]) .hc-pdd-placeholder i{background:#232936}
 html:not([data-hc-theme="light"]) .hc-pdd-placeholder i::after{background:linear-gradient(90deg,transparent,rgba(255,255,255,.15),transparent)}
 html:not([data-hc-theme="light"]) .hc-pdd-wait,html:not([data-hc-theme="light"]) .hc-pdd-warning,html:not([data-hc-theme="light"]) .hc-pdd-tips{color:#8e98aa!important}
 html:not([data-hc-theme="light"]) #hc-pdd-back{background:#181c24;border-bottom-color:#262c36}
 }
-.hc-pdd-card:nth-of-type(2){display:none!important}
+.hc-pdd-heading-actions{display:flex;align-items:center;gap:12px;flex-shrink:0}
+.hc-pdd-phone-manage:not([hidden]) + button{position:relative}
+.hc-pdd-phone-manage:not([hidden]) + button::before{content:'';position:absolute;left:-6px;top:50%;height:10px;border-left:1px solid #e1e5eb;transform:translateY(-50%)}
+html:not([data-hc-theme="light"]) .hc-pdd-phone-manage:not([hidden]) + button::before{border-left-color:#333c4d}
 #hc-pdd-shell[hidden],#hc-pdd-back[hidden]{display:none!important}
-html.hc-pdd-source-mode,html.hc-pdd-source-mode body{overflow:hidden!important}
-.hc-pdd-source-mode [data-hc-pdd-source]{left:0!important;top:44px!important;height:calc(100vh - 44px)!important;pointer-events:auto!important}
+html.hc-pdd-source-mode body{padding:44px 0 0!important}
+.hc-pdd-source-mode [data-hc-pdd-source]{position:relative!important;left:auto!important;top:auto!important;height:auto!important;min-height:calc(100vh - 44px)!important;transform:none!important;pointer-events:auto!important}
 `;
   document.head.appendChild(style);
   shell = document.createElement('main'); shell.id = 'hc-pdd-shell';
-  shell.innerHTML = '<section class="hc-pdd-card"><div class="hc-pdd-heading"><h2>身份码</h2><button type="button" data-hc-pdd-refresh="identity">刷新</button></div><div class="hc-pdd-content" id="hc-pdd-identity">' + placeholder(true) + '</div></section><section class="hc-pdd-card"><div class="hc-pdd-heading"><h2>待取包裹</h2><button type="button" data-hc-pdd-refresh="parcels">刷新</button></div><div class="hc-pdd-content" id="hc-pdd-parcels">' + placeholder(false) + '</div></section>';
+  var identityCard = '<section class="hc-pdd-card"><div class="hc-pdd-heading"><h2>身份码</h2><button type="button" data-hc-pdd-refresh="identity">刷新</button></div><div class="hc-pdd-content" id="hc-pdd-identity">' + placeholder(true) + '</div></section>';
+  var parcelsCard = '<section class="hc-pdd-card"><div class="hc-pdd-heading"><h2>待取包裹</h2><div class="hc-pdd-heading-actions"><button type="button" class="hc-pdd-phone-manage">添加手机号</button><button type="button" data-hc-pdd-refresh="parcels">刷新</button></div></div><div class="hc-pdd-content" id="hc-pdd-parcels">' + placeholder(false) + '</div></section>';
+  shell.innerHTML = parcelsOnly ? parcelsCard : identityCard;
   document.body.appendChild(shell);
   backBar = document.createElement('div'); backBar.id = 'hc-pdd-back'; backBar.hidden = true;
-  backBar.innerHTML = '<button type="button">‹ 返回取件页</button>';
+  backBar.innerHTML = '<button type="button">‹ 返回待取包裹</button>';
+  if (!parcelsOnly) backBar.querySelector('button').textContent = '‹ 返回身份码';
   backBar.querySelector('button').addEventListener('click', back);
   document.body.appendChild(backBar);
   shell.addEventListener('click', clicked);
@@ -428,10 +474,9 @@ html.hc-pdd-source-mode,html.hc-pdd-source-mode body{overflow:hidden!important}
  }
  function parcelsSnapshot() {
   if (!source) return {ready:false,orders:[]};
-  var empty = source.querySelector('[class*="package-none-container"]');
-  if (empty) return {ready:true,orders:[]};
   var items = Array.from(source.querySelectorAll('[class*="package-list-wrapper"] .package-list-picking'));
   if (!items.length) {
+   if (source.querySelector('[class*="package-none-container"]')) return {ready:true,orders:[]};
    var m = document.getElementById('hc-pdd-parcels');
    return {ready:!!(m && m.dataset.ready === 'true'),orders:[]};
   }
@@ -442,8 +487,28 @@ html.hc-pdd-source-mode,html.hc-pdd-source-mode body{overflow:hidden!important}
    if (sh && !/^20\d\d-\d{1,2}(?:-\d{1,2})?$/.test(sh[1])) return sh[1];
    return '';
   }
-  var rows = [], seen = Object.create(null);
+  var rows = [];
   items.slice(0, 40).forEach(function (node, idx) {
+   var stationName = node.querySelector('.station-name');
+   var station = (stationName && stationName.textContent.trim()) || '拼多多驿站包裹';
+   // The official page puts several package rows inside a single station group.
+   var codeValues = node.querySelectorAll('.package-code-value');
+   if (codeValues.length) {
+    codeValues.forEach(function (value, parcelIndex) {
+     var match = value.textContent.match(/^[:：\s【\[（(]*([A-Za-z0-9][A-Za-z0-9-]{1,15})[\s】\]）)]*$/);
+     if (!match) return;
+     var parcel = value.closest('.package-desc');
+     var shipping = parcel && parcel.querySelector('.package-shipping-name-text');
+     rows.push({
+      id:'pdd_' + idx + '_' + parcelIndex,
+      name:station.slice(0, 80), status:'待取件',
+      detail:shipping ? shipping.textContent.trim().slice(0, 300) : '',
+      code:match[1]
+     });
+    });
+    return;
+   }
+
    var raw = (node.innerText || node.textContent || '').trim();
    if (!raw) return;
    var lines = raw.split(/\n+/).map(function (l) { return l.trim(); }).filter(function (l) {
@@ -456,13 +521,12 @@ html.hc-pdd-source-mode,html.hc-pdd-source-mode body{overflow:hidden!important}
     }
    }
    if (!c) return;
-   if (seen[c]) return;
-   seen[c] = true;
-   var station = '拼多多驿站包裹';
-   for (var j = 0; j < lines.length; j++) {
-    if (/驿站|买菜|代收|丰巢|快递|自提/.test(lines[j]) && lines[j] !== c) { station = lines[j].slice(0, 80); break; }
+   if (!stationName) {
+    for (var j = 0; j < lines.length; j++) {
+     if (/驿站|买菜|代收|丰巢|快递|自提/.test(lines[j]) && lines[j] !== c) { station = lines[j]; break; }
+    }
    }
-   rows.push({id:'pdd_' + idx + '_' + c, name:station, status:'待取件', detail:lines.join(' · ').slice(0, 300), code:c});
+   rows.push({id:'pdd_' + idx + '_0', name:station.slice(0, 80), status:'待取件', detail:lines.join(' · ').slice(0, 300), code:c});
   });
   return {ready:true,orders:rows};
  }
