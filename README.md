@@ -18,10 +18,6 @@ HandyCode brings official identity codes and pending parcel pickup information i
 
 本仓库由 [l-egend](https://github.com/l-egend) 维护，fork 自 [原 HandyCode 项目](https://github.com/xianhe51920/handycode)。
 
-| 项目 | 信息 |
-| --- | --- |
-| 个人主页 | |
-| 联系方式 | |
 
 ## 免责声明
 
