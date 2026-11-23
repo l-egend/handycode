@@ -1,6 +1,6 @@
 # HandyCode
 
-<p align="center"><img src="design/icon-candidates/icon-02.png" alt="HandyCode 应用图标" width="160"></p>
+<p align="center"><img src="app/src/main/res/drawable-nodpi/ic_launcher_artwork.png" alt="HandyCode 应用图标" width="128"></p>
 
 HandyCode 是一个 Android 取件工具。底栏可打开拼多多、菜鸟｜淘宝和京东的官方身份码，最右侧「取件码」汇总淘宝、拼多多、京东、顺丰和抖音官方页面提供的待取件信息。
 
@@ -159,11 +159,9 @@ AndroidX WebKit 精简库随仓库提供并在构建前校验 SHA256；其来源
 
 ## 应用图标
 
-图标采用奶油色圆角底板、深红描边与角色抱快递箱的设计。源图位于 `design/icon-candidates/icon-02.png`。
+README 页首使用当前 Android 源码中的同一张图标。自适应图标保留原图的深色背景，桌面会按系统形状裁切。
 
-采用 Android 自适应图标：`mipmap-anydpi-v26/ic_launcher.xml` 组合背景色 `#FCF6E7` 与前景位图，前景用 `<inset>` 内缩 13%。这个比例是按「底板描边正好落在 72dp 可见视口边缘」算出来的，使深红描边贴住图标边界；背景与底板同色，遮罩裁切不会露出接缝。
-
-一套资源即可适配所有密度与桌面图标尺寸，不需要多套 `mipmap-*dpi`。但遮罩形状由桌面决定，红框只能对齐圆角方形遮罩，圆形遮罩桌面上四角描边会被裁掉一部分。换算方式、重新生成步骤和验收记录见 [应用图标原理](docs/launcher-icon.md)。
+[旧版图标设计记录](docs/launcher-icon.md)
 
 ## 检查与已知边界
 
@@ -196,7 +194,7 @@ Java 文件均位于 `app/src/main/java/com/fairycrane/handycode/`，网页资�
 
 源码以 [MIT 许可](LICENSE) 发布。随仓库提供的 AndroidX WebKit 精简库为 Apache License 2.0，来源与许可文本见 [third_party/androidx-webkit-1.13.0](third_party/androidx-webkit-1.13.0/README.md)。
 
-应用图标由作者提供的参考图生成，仅作本项目标识使用；若其中涉及第三方角色形象，其权利归原权利人，MIT 许可不涵盖该图形。
+应用图标用于项目标识，图形权利归原权利人。
 
 
 ## 京东身份码与取件码
